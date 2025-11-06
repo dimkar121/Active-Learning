@@ -4,6 +4,7 @@ import lib as lib
 import random
 import faiss
 from sklearn.metrics import f1_score, precision_score, recall_score
+from tqdm import tqdm
 
 
 NUM_ITERATIONS = 8
@@ -38,7 +39,7 @@ for i, r in df_gt.iterrows():
      else:
           truthD[idAbt] = [idBuy]
           a += 1
-matches = len(truthD.keys()) + a
+matches =  a
 print("No of matches=", matches)
 
 #gt_lookup = {
@@ -72,70 +73,71 @@ df_a, df_b = lib.bootstrap_embeddings_only(
 abt_id_mapper = df_a['id'].to_dict()
 buy_id_mapper = df_b['id'].to_dict()
 
-
-# Create fast lookup dicts from the NEW dataframes (which have 'v')
 a_lookup = {row['text']: row for _, row in df_a.iterrows()}
 b_lookup = {row['text']: row for _, row in df_b.iterrows()}
 
-# --- 3. Create Candidate and Test Pools ---
+
+# --- 4. Create Candidate and Test Pools (The New Logic) ---
 print("\n--- Creating Test and Unlabeled Pools ---")
 full_candidate_pool_text = lib.get_candidate_pool(df_a, df_b, k=10)
+random.shuffle(full_candidate_pool_text)
 
-# Label this entire pool *once* so we can create our sets
-print("Querying Oracle to create Test/Unlabeled pools...")
-full_labeled_pool = lib.query_oracle(
-    full_candidate_pool_text, a_lookup, b_lookup, gt_lookup, "id" , "id" 
+# Split the *unlabeled text*
+test_set_size = int(len(full_candidate_pool_text) * 0.2)
+test_pool_text = full_candidate_pool_text[:test_set_size]
+unlabeled_pool_text = full_candidate_pool_text[test_set_size:]
+
+# Call the Oracle ONCE to create the permanent, clean test set
+print("Querying Oracle *once* to create the Test Set...")
+test_set = lib.query_oracle(
+    test_pool_text, a_lookup, b_lookup, gt_lookup, "id" , "id" 
 )
-random.shuffle(full_labeled_pool)
-
-# Split into a Test set (to evaluate models) and an Unlabeled Pool (to query)
-test_set_size = int(len(full_labeled_pool) * 0.2)
-test_set = full_labeled_pool[:test_set_size]
-unlabeled_pool = full_labeled_pool[test_set_size:]
-
 print(f"Created Test Set with {len(test_set)} pairs.")
-print(f"Created Unlabeled Pool with {len(unlabeled_pool)} pairs.")
 
-
+# --- 5. Iteration 0 (Seeding) ---
 print(f"\n--- Iteration 0: Training CLEAN Seed Model ---")
-# We take our first "seed" labels from the unlabeled pool
-current_clean_training_set = unlabeled_pool[:SEED_SIZE]
-unlabeled_pool = unlabeled_pool[SEED_SIZE:] # Remove them
+# Get the first SEED_SIZE pairs from the unlabeled pool
+seed_pairs_text = unlabeled_pool_text[:SEED_SIZE]
+unlabeled_pool_text = unlabeled_pool_text[SEED_SIZE:] # Remove them
+
+# Call the Oracle to label *only* the seed pairs
+print(f"Querying Oracle for {SEED_SIZE} seed labels...")
+current_clean_training_set = lib.query_oracle(
+    seed_pairs_text, a_lookup, b_lookup, gt_lookup, "id" , "id"
+)
 
 print(f"Training on initial *clean* seed set of {len(current_clean_training_set)} labels.")
-model, scaler, f1, bt1 = lib.train_classifier(current_clean_training_set, test_set, a_lookup, b_lookup)
+model, scaler, f1, best_threshold1 = lib.train_classifier(
+    current_clean_training_set, test_set, a_lookup, b_lookup
+)
 print(f"--- Iteration 0 (Clean) F1-Score: {f1:.4f} ---")
 
+# --- 6. The Active Learning Loop (The New Logic) ---
+last_f1_score = f1
+MIN_IMPROVEMENT_THRESHOLD = 0.01
 
-
-
-# This is our set of clean, oracle-verified labels. It starts empty.
-current_clean_training_set = []
-last_f1_score = 0.0  # Track the F1 score from the previous iteration
-MIN_IMPROVEMENT_THRESHOLD = 0.01  # Stop if F1 improves by less than 0.5%
-
-# --- 5. The Active Learning Loop ---
 for i in range(1, NUM_ITERATIONS + 1):
     print(f"\n--- Iteration {i} ---")
     
-    if not unlabeled_pool:
+    if not unlabeled_pool_text:
         print("Unlabeled pool is empty. Stopping iteration.")
         break
 
-    # --- a. Predict on the unlabeled pool ---
-    print(f"Predicting on {len(unlabeled_pool)} unlabeled pairs...")
+    # --- a. Predict on the UNLABELED pool ---
+    print(f"Predicting on {len(unlabeled_pool_text)} unlabeled pairs...")
     
     X_unlabeled_list = []
-    pairs_for_this_batch = []
+    # We must keep track of the original text pairs
+    pairs_for_this_batch = [] 
     
-    for pair in unlabeled_pool:
-        record_a = a_lookup.get(pair[0])
-        record_b = b_lookup.get(pair[1])
+    for (text_a, text_b) in tqdm(unlabeled_pool_text): # Use tqdm for a progress bar
+        record_a = a_lookup.get(text_a)
+        record_b = b_lookup.get(text_b)
         if record_a is not None and record_b is not None:
             features = lib.create_pure_embedding_vector(record_a, record_b)
             if features.shape[0] == 1536:
                 X_unlabeled_list.append(features)
-                pairs_for_this_batch.append(pair)
+                pairs_for_this_batch.append((text_a, text_b)) # Store the text tuple
                 
     X_unlabeled_matrix = np.array(X_unlabeled_list)
     
@@ -144,51 +146,57 @@ for i in range(1, NUM_ITERATIONS + 1):
         break
         
     X_unlabeled_scaled = scaler.transform(X_unlabeled_matrix)
-    preds_prob = model.predict(X_unlabeled_scaled).flatten()
+    preds_prob = model.predict(X_unlabeled_scaled, batch_size=256).flatten()
     
-    # --- b. Select pairs to label ---
-    # We query the pairs the model is *most confident* are matches
-    most_confident_indices = np.argsort(preds_prob)[-LABELS_PER_ITERATION:]
-    pairs_to_label = [pairs_for_this_batch[idx] for idx in most_confident_indices]
+    # --- b. Select pairs to label (Hybrid Strategy) ---
+    half_batch = LABELS_PER_ITERATION // 2
     
-    # --- c. "Query the Oracle" and add to training set ---
-    # `pairs_to_label` already has the correct label
-    new_labels_found = len(pairs_to_label)
-    print(f"Adding {new_labels_found} new *clean* labels to training set.")
-    current_clean_training_set.extend(pairs_to_label)
+    # 1. "Most confused"
+    confidence = np.abs(preds_prob - 0.5)
+    most_confused_indices = np.argsort(confidence)[:half_batch]
     
-    # --- d. Remove these new labels from the unlabeled pool ---
-    unlabeled_pool_set = set(unlabeled_pool)
-    pairs_to_label_set = set(pairs_to_label)
-    unlabeled_pool = list(unlabeled_pool_set - pairs_to_label_set)
+    # 2. "Most confident"
+    most_confident_indices = np.argsort(preds_prob)[-half_batch:]
     
-    # --- e. Re-train the model on ALL clean labels found so far ---
-
+    indices_to_label = np.unique(np.concatenate([most_confused_indices, most_confident_indices]))
+    
+    # Get the *text pairs* to send to the oracle
+    pairs_to_label_text = [pairs_for_this_batch[idx] for idx in indices_to_label]
+    
+    # --- c. Query the Oracle *inside the loop* ---
+    print(f"Querying Oracle for {len(pairs_to_label_text)} new pairs...")
+    newly_labeled_pairs = lib.query_oracle(
+        pairs_to_label_text, a_lookup, b_lookup, gt_lookup, "id" , "id"
+    )
+    current_clean_training_set.extend(newly_labeled_pairs)
+    
+    # --- d. Remove from unlabeled pool ---
+    # This is now a simple set difference on the text tuples
+    unlabeled_pool_text = list(set(unlabeled_pool_text) - set(pairs_to_label_text))
+    
+    # --- e. Re-train the model ---
     total_labels = len(current_clean_training_set)
-    
-    # The label is the 3rd element in the tuple (index 2)
-    num_positives = sum(1 for pair in current_clean_training_set if pair[2] == 1.0)
+    num_positives = sum(1 for p in current_clean_training_set if p[2] == 1.0)
     num_negatives = total_labels - num_positives
     
     print(f"Re-training model on {total_labels} total clean labels:")
     print(f"  - Positives (Matches):    {num_positives}")
     print(f"  - Negatives (No Matches): {num_negatives}")
 
-    print(f"Re-training model on {len(current_clean_training_set)} total clean labels.")
-    model, scaler, f1, best_threshold1 = lib.train_classifier(current_clean_training_set, test_set, a_lookup, b_lookup)
+    model, scaler, f1, best_threshold1 = lib.train_classifier(
+        current_clean_training_set, test_set, a_lookup, b_lookup
+    )
     
     print(f"--- Iteration {i} F1-Score: {f1:.4f} ---")
+    
     improvement = f1 - last_f1_score
-    if improvement < MIN_IMPROVEMENT_THRESHOLD and i > 1: # Don't stop on the first iteration
+    if improvement < MIN_IMPROVEMENT_THRESHOLD and i > 1:
         print(f"\nF1-Score improved by only {improvement:.4f}. Stopping Active Learning loop early.")
-        break # Exit the loop
-
-    last_f1_score = f1 # Update the score for the next iteration
-
+        break
+    last_f1_score = f1
 
 print("\nActive Learning loop complete.")
-print(f"Final F1-Score: {f1:.4f} at threshold {best_threshold1:.4f}")
-
+print(f"Final Recall Model F1-Score: {f1:.4f} at threshold {best_threshold1:.4f}")
 
 
 
@@ -218,7 +226,7 @@ buy_embeddings = np.array(df_b['v'].tolist()).astype(np.float32)
 #amazon_id_to_index = {id_val: index for index, id_val in amazon_id_mapper.items()}
 #walmart_id_to_index = {id_val: index for index, id_val in walmart_id_mapper.items()}
 
-print("\n--- 4. Building Faiss index for Walmart records ---")
+print("\n--- 4. Building Faiss index for Abt records ---")
 d = buy_embeddings.shape[1]
 index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
 index.hnsw.efConstruction = 60

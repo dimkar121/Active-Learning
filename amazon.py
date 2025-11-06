@@ -218,7 +218,7 @@ google_embeddings = np.array(df_b['v'].tolist()).astype(np.float32)
 #amazon_id_to_index = {id_val: index for index, id_val in amazon_id_mapper.items()}
 #walmart_id_to_index = {id_val: index for index, id_val in walmart_id_mapper.items()}
 
-print("\n--- 4. Building Faiss index for Walmart records ---")
+print("\n--- 4. Building Faiss index for amazon records ---")
 d = amazon_embeddings.shape[1]
 index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
 index.hnsw.efConstruction = 60
