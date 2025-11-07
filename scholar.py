@@ -178,9 +178,11 @@ for i in range(1, NUM_ITERATIONS + 1):
     print(f"  - Positives (Matches):    {num_positives}")
     print(f"  - Negatives (No Matches): {num_negatives}")
 
+
     model, scaler, f1, best_threshold1 = lib.train_classifier(
         current_clean_training_set, test_set, a_lookup, b_lookup
     )
+    print("classification task complete.")
     
     print(f"--- Iteration {i} F1-Score: {f1:.4f} ---")
     

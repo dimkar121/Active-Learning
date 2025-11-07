@@ -190,6 +190,9 @@ def create_pure_embedding_vector(record_a, record_b):
     final_vector = np.concatenate([v_a, v_b, v_diff, v_prod])
     return final_vector
 
+
+
+
 def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
     """
     Trains a new MLP classifier on the provided training pairs
@@ -213,6 +216,7 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
     X_train = np.array(X_train_list)
     y_train = np.array(y_train_list)
 
+
     if len(X_train) == 0:
         print("No valid training data found.")
         return None, None, 0.0
@@ -231,6 +235,7 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
                 X_val_list.append(features)
                 y_val_list.append(label)
     
+
     X_val = np.array(X_val_list)
     y_val = np.array(y_val_list)
 
@@ -252,7 +257,7 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4),
                   loss='binary_crossentropy',
                   metrics=['accuracy'])
-    
+
     # Calculate class weights for imbalance
     total = len(y_train)
     neg = np.sum(y_train == 0)
@@ -260,6 +265,7 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
     weight_for_0 = (1 / neg) * (total / 2.0) if neg > 0 else 1
     weight_for_1 = (1 / pos) * (total / 2.0) if pos > 0 else 1
 
+    print(f"before fit {len(X_train_scaled)}   {len(X_val_scaled)}")
     model.fit(
         X_train_scaled,
         y_train,
@@ -270,7 +276,8 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
         callbacks=[tf.keras.callbacks.EarlyStopping(patience=3, restore_best_weights=True)],
         verbose=0 # Set to 1 to see training progress
     )
-    
+    print("after fit") 
+   
     # --- 5. Evaluate and Return ---
     preds_prob = model.predict(X_val_scaled).flatten()
     preds_binary = (preds_prob > 0.5).astype(int)
@@ -297,7 +304,7 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
 
 
 
-def get_candidate_pool(df_a, df_b, k=10):
+def get_candidate_pool(df_a, df_b, k=7):
     """
     Uses FAISS on the fine-tuned 'v' embeddings to create a
     large pool of high-potential candidate pairs.
