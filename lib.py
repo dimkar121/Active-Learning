@@ -265,7 +265,6 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
     weight_for_0 = (1 / neg) * (total / 2.0) if neg > 0 else 1
     weight_for_1 = (1 / pos) * (total / 2.0) if pos > 0 else 1
 
-    print(f"before fit {len(X_train_scaled)}   {len(X_val_scaled)}")
     model.fit(
         X_train_scaled,
         y_train,
@@ -276,7 +275,6 @@ def train_classifier(training_pairs, validation_pairs, a_lookup, b_lookup):
         callbacks=[tf.keras.callbacks.EarlyStopping(patience=3, restore_best_weights=True)],
         verbose=0 # Set to 1 to see training progress
     )
-    print("after fit") 
    
     # --- 5. Evaluate and Return ---
     preds_prob = model.predict(X_val_scaled).flatten()

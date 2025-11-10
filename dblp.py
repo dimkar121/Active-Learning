@@ -10,10 +10,10 @@ from sklearn.cluster import MiniBatchKMeans
 # --- 1. Configuration & Setup ---
 
 # --- Scalability Settings ---
-N_PARTITIONS = 5 # Split the dataset into 20 chunks
-NUM_ITERATIONS_PER_PARTITION = 3 # Run 3 AL iterations on each chunk
-LABELS_PER_ITERATION = 200 # Query 200 labels per iteration
-SEED_SIZE = 20             # Seed each partition's loop with 20 labels
+N_PARTITIONS = 8 # Split the dataset into 20 chunks
+NUM_ITERATIONS_PER_PARTITION = 5 # Run 3 AL iterations on each chunk
+LABELS_PER_ITERATION = 1000 # Query 200 labels per iteration
+SEED_SIZE = 1000             # Seed each partition's loop with 20 labels
 
 # --- NEW: Validation Set Configuration ---
 # We create one fixed, fast validation set.
@@ -23,28 +23,29 @@ VAL_SET_PROPORTION = 0.1
 VAL_SET_MAX_SIZE = 20000  # Cap at 20,000 pairs
 
 # --- Data paths and columns ---
-PATH_RAW_A = './data/Scholar.csv'
-PATH_RAW_B = './data/DBLP2.csv'
-PATH_GT = './data/truth_Scholar_DBLP.csv'
-ID_COL_A = 'idScholar'
-ID_COL_B = 'idDBLP'
-COLS_TO_USE = ['title', 'authors', 'venue', 'year']
+PATH_RAW_A = './data/test_dblp_A.txt'
+PATH_RAW_B = './data/test_dblp_B.txt'
+PATH_GT = './data/truth_DBLP.csv'
+ID_COL_A = 'id1'
+ID_COL_B = 'id2'
+COLS_TO_USE = ["author1","author2","title","year"]
 
 # --- 2. Load Data and Oracle ---
 print("--- Loading Raw Data and Oracle ---")
-df_a_raw = pd.read_csv(PATH_RAW_A, encoding='utf-8')
-df_b_raw = pd.read_csv(PATH_RAW_B, encoding='utf-8')
-df_gt = pd.read_csv(PATH_GT, encoding="unicode_escape", keep_default_na=False)
+cols=["id","author1","author2","title","year"]
+df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip', nrows=200_000 )
+df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip', nrows=200_000 )
+df_gt = pd.read_csv(PATH_GT, encoding="utf-8", nrows=100_000,  keep_default_na=False)
 
 # Build the Oracle (gt_lookup)
 truthD = dict()
 for i, r in df_gt.iterrows():
-     idDBLP = r["idDBLP"]
-     idScholar = r["idScholar"]
-     if idScholar in truthD:
-           truthD[idScholar].append(idDBLP)
-     else:
-           truthD[idScholar] = [idDBLP]
+     id1 = r["id1"]
+     id2 = [r["id2"]]        
+     truthD[id1] = id2
+
+matches = len(truthD.keys()) 
+print("total matches=",matches)
 gt_lookup = {
     (str(key), str(value))
     for key, value_list in truthD.items()
@@ -52,15 +53,16 @@ gt_lookup = {
 }
 print(f"Loaded Oracle with {len(gt_lookup)} total matches.")
 
+
 # --- 3. Bootstrap Embeddings (Phase 1) ---
 df_a, df_b = lib.bootstrap_embeddings_only(
       df_a_raw, df_b_raw, "source_a", "source_b", COLS_TO_USE
 )
 
 
-dblp_embeddings = np.array(df_b['v'].tolist()).astype('float32')
+b_embeddings = np.array(df_b['v'].tolist()).astype('float32')
 df_b_whole  = df_b
-SAMPLE_PROPORTION = 0.2
+SAMPLE_PROPORTION = 0.3
 SAMPLE_SIZE= int(len(df_b) * SAMPLE_PROPORTION)
 df_b = df_b.sample(n=SAMPLE_SIZE, random_state=42)
 
@@ -250,7 +252,7 @@ print("\n--- Starting Final Two-Stage Resolution ---")
 
 # 1. Build the *global* FAISS index for df_a (Scholar)
 #print(f"Building final FAISS index for Scholar (df_a)...")
-scholar_embeddings = np.array(df_a['v'].tolist()).astype(np.float32)
+a_embeddings = np.array(df_a['v'].tolist()).astype(np.float32)
 #d = scholar_embeddings.shape[1]
 #index_a = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
 #faiss.normalize_L2(scholar_embeddings)
@@ -258,29 +260,29 @@ scholar_embeddings = np.array(df_a['v'].tolist()).astype(np.float32)
 #print(f"Index built successfully with {index_a.ntotal} records.")
 
 # 2. Search with all of df_b (DBLP)
-faiss.normalize_L2(dblp_embeddings)
-D, I = index.search(dblp_embeddings, k=5)
+faiss.normalize_L2(b_embeddings)
+D, I = index.search(b_embeddings, k=5)
 
 # --- 3. Stage 1 (Recall Filter) ---
 X_stage1_features = []
-stage1_pairs_data = [] # Store (scholar_record, dblp_record)
+stage1_pairs_data = [] # Store (a_record, b_record)
 y_true_list_stage1 = [] # Store all true labels for a *full* recall calculation
 
 print("Running Stage 1 (Fast Recall)...")
-for dblp_idx, scholar_indices in enumerate(I):
-    dblp_record = df_b_whole.iloc[dblp_idx]
+for b_idx, a_indices in enumerate(I):
+    b_record = df_b_whole.iloc[b_idx]
 
-    for scholar_idx in scholar_indices:
-        scholar_record = df_a.iloc[scholar_idx]
+    for a_idx in a_indices:
+        a_record = df_a.iloc[a_idx]
 
         # Add to lists
-        stage1_pairs_data.append((scholar_record, dblp_record))
-        X_stage1_features.append(lib.create_pure_embedding_vector(scholar_record, dblp_record))
+        stage1_pairs_data.append((a_record, b_record))
+        X_stage1_features.append(lib.create_pure_embedding_vector(a_record, b_record))
 
         # Get true label for this pair
-        scholar_id = str(scholar_record["id"])
-        dblp_id = str(dblp_record["id"])
-        y_true_list_stage1.append(1.0 if (scholar_id, dblp_id) in gt_lookup else 0.0)
+        a_id = str(a_record["id"])
+        b_id = str(b_record["id"])
+        y_true_list_stage1.append(1.0 if (a_id, b_id) in gt_lookup else 0.0)
 
 X_stage1_matrix = np.array(X_stage1_features)
 X_stage1_scaled = scaler.transform(X_stage1_matrix)
@@ -308,10 +310,10 @@ if len(stage2_candidate_indices) > 0:
 
     print("Running Stage 2 (Smart Precision)...")
     for idx in stage2_candidate_indices:
-        scholar_record, dblp_record = stage1_pairs_data[idx]
+        a_record, b_record = stage1_pairs_data[idx]
 
         # Create the SLOW, HYBRID feature vector
-        hybrid_features = lib.create_hybrid_feature_vector(scholar_record, dblp_record, col="title")
+        hybrid_features = lib.create_hybrid_feature_vector(a_record, b_record, col="title")
         X_stage2_features.append(hybrid_features)
 
         # Get the true label
