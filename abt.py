@@ -3,15 +3,27 @@ import numpy as np
 import lib as lib
 import random
 import faiss
-from sklearn.metrics import f1_score, precision_score, recall_score
 from tqdm import tqdm
+from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
+from sklearn.cluster import MiniBatchKMeans
 
+# --- 1. Configuration & Setup ---
 
-NUM_ITERATIONS = 8
-LABELS_PER_ITERATION = 1000 # The number of new labels we "buy" from the oracle
-SEED_SIZE = 100
+# --- Scalability Settings ---
+N_PARTITIONS = 5 # Split the dataset into 20 chunks
+NUM_ITERATIONS_PER_PARTITION = 8 # Run 3 AL iterations on each chunk
+LABELS_PER_ITERATION = 200 # Query 200 labels per iteration
+SEED_SIZE = 100             # Seed each partition's loop with 20 labels
 
-# --- Define your data paths and column names ---
+# --- NEW: Validation Set Configuration ---
+# We create one fixed, fast validation set.
+# We'll make it proportional to the *first* partition's candidate pool,
+# but cap it to ensure it's always fast.
+VAL_SET_PROPORTION = 0.1
+VAL_SET_MAX_SIZE = 20000  # Cap at 20,000 pairs
+
+# --- Data paths and columns ---
+
 PATH_RAW_A = './data/Abt.csv'
 PATH_RAW_B = './data/Buy.csv'
 PATH_GT = './data/truth_abt_buy.csv'
@@ -42,322 +54,325 @@ for i, r in df_gt.iterrows():
 matches =  a
 print("No of matches=", matches)
 
-#gt_lookup = {
-#    (str(id1), str(id2)) 
-#    for id1, id2 in zip(df_gt[ID_COL_A], df_gt[ID_COL_B])
-#}
-#print(gt_lookup)
-#exit(1)
-
 gt_lookup = {
     (str(key), str(value))
     for key, value_list in truthD.items()
     for value in value_list
 }
+print(f"Loaded Oracle with {len(gt_lookup)} total matches.")
 
-
+# --- 3. Bootstrap Embeddings (Phase 1) ---
 df_a, df_b = lib.bootstrap_embeddings_only(
       df_a_raw, df_b_raw, "source_a", "source_b", COLS_TO_USE
 )
 
 
+buy_embeddings = np.array(df_b['v'].tolist()).astype('float32')
+df_b_whole  = df_b
+SAMPLE_PROPORTION = 0.4
+SAMPLE_SIZE= int(len(df_b) * SAMPLE_PROPORTION)
+df_b = df_b.sample(n=SAMPLE_SIZE, random_state=42)
 
-# --- 2. Iteration 0 (Bootstrapping) ---
-# This is the new, crucial first step.
-# It creates the .pqt files and our first noisy training set.
-#df_a, df_b, noisy_training_pairs = lib.bootstrap_and_get_noisy_labels(
-#    df_a_raw, df_b_raw, "source_a", "source_b", COLS_TO_USE
-#)
-
-
-abt_id_mapper = df_a['id'].to_dict()
-buy_id_mapper = df_b['id'].to_dict()
-
+# Create fast lookup dicts (text -> full record)
 a_lookup = {row['text']: row for _, row in df_a.iterrows()}
 b_lookup = {row['text']: row for _, row in df_b.iterrows()}
 
+# --- 4. Partitioning (The "Chunks" Strategy) ---
+print(f"\n--- Partitioning data into {N_PARTITIONS} chunks using KMeans ---")
+embeddings_a = np.array(df_a['v'].tolist()).astype('float32')
+embeddings_b = np.array(df_b['v'].tolist()).astype('float32')
+kmeans = MiniBatchKMeans(n_clusters=N_PARTITIONS, random_state=42, batch_size=256, n_init=3)
+df_b['partition'] = kmeans.fit_predict(embeddings_b)
 
-# --- 4. Create Candidate and Test Pools (The New Logic) ---
-print("\n--- Creating Test and Unlabeled Pools ---")
-full_candidate_pool_text = lib.get_candidate_pool(df_a, df_b, k=10)
-random.shuffle(full_candidate_pool_text)
-
-# Split the *unlabeled text*
-test_set_size = int(len(full_candidate_pool_text) * 0.2)
-test_pool_text = full_candidate_pool_text[:test_set_size]
-unlabeled_pool_text = full_candidate_pool_text[test_set_size:]
-
-# Call the Oracle ONCE to create the permanent, clean test set
-print("Querying Oracle *once* to create the Test Set...")
-test_set = lib.query_oracle(
-    test_pool_text, a_lookup, b_lookup, gt_lookup, "id" , "id" 
-)
-print(f"Created Test Set with {len(test_set)} pairs.")
-
-# --- 5. Iteration 0 (Seeding) ---
-print(f"\n--- Iteration 0: Training CLEAN Seed Model ---")
-# Get the first SEED_SIZE pairs from the unlabeled pool
-seed_pairs_text = unlabeled_pool_text[:SEED_SIZE]
-unlabeled_pool_text = unlabeled_pool_text[SEED_SIZE:] # Remove them
-
-# Call the Oracle to label *only* the seed pairs
-print(f"Querying Oracle for {SEED_SIZE} seed labels...")
-current_clean_training_set = lib.query_oracle(
-    seed_pairs_text, a_lookup, b_lookup, gt_lookup, "id" , "id"
-)
-
-print(f"Training on initial *clean* seed set of {len(current_clean_training_set)} labels.")
-model, scaler, f1, best_threshold1 = lib.train_classifier(
-    current_clean_training_set, test_set, a_lookup, b_lookup
-)
-print(f"--- Iteration 0 (Clean) F1-Score: {f1:.4f} ---")
-
-# --- 6. The Active Learning Loop (The New Logic) ---
-last_f1_score = f1
-MIN_IMPROVEMENT_THRESHOLD = 0.01
-
-for i in range(1, NUM_ITERATIONS + 1):
-    print(f"\n--- Iteration {i} ---")
-    
-    if not unlabeled_pool_text:
-        print("Unlabeled pool is empty. Stopping iteration.")
-        break
-
-    # --- a. Predict on the UNLABELED pool ---
-    print(f"Predicting on {len(unlabeled_pool_text)} unlabeled pairs...")
-    
-    X_unlabeled_list = []
-    # We must keep track of the original text pairs
-    pairs_for_this_batch = [] 
-    
-    for (text_a, text_b) in tqdm(unlabeled_pool_text): # Use tqdm for a progress bar
-        record_a = a_lookup.get(text_a)
-        record_b = b_lookup.get(text_b)
-        if record_a is not None and record_b is not None:
-            features = lib.create_pure_embedding_vector(record_a, record_b)
-            if features.shape[0] == 1536:
-                X_unlabeled_list.append(features)
-                pairs_for_this_batch.append((text_a, text_b)) # Store the text tuple
-                
-    X_unlabeled_matrix = np.array(X_unlabeled_list)
-    
-    if len(X_unlabeled_matrix) == 0:
-        print("No valid pairs left in unlabeled pool. Stopping.")
-        break
-        
-    X_unlabeled_scaled = scaler.transform(X_unlabeled_matrix)
-    preds_prob = model.predict(X_unlabeled_scaled, batch_size=256).flatten()
-    
-    # --- b. Select pairs to label (Hybrid Strategy) ---
-    half_batch = LABELS_PER_ITERATION // 2
-    
-    # 1. "Most confused"
-    confidence = np.abs(preds_prob - 0.5)
-    most_confused_indices = np.argsort(confidence)[:half_batch]
-    
-    # 2. "Most confident"
-    most_confident_indices = np.argsort(preds_prob)[-half_batch:]
-    
-    indices_to_label = np.unique(np.concatenate([most_confused_indices, most_confident_indices]))
-    
-    # Get the *text pairs* to send to the oracle
-    pairs_to_label_text = [pairs_for_this_batch[idx] for idx in indices_to_label]
-    
-    # --- c. Query the Oracle *inside the loop* ---
-    print(f"Querying Oracle for {len(pairs_to_label_text)} new pairs...")
-    newly_labeled_pairs = lib.query_oracle(
-        pairs_to_label_text, a_lookup, b_lookup, gt_lookup, "id" , "id"
-    )
-    current_clean_training_set.extend(newly_labeled_pairs)
-    
-    # --- d. Remove from unlabeled pool ---
-    # This is now a simple set difference on the text tuples
-    unlabeled_pool_text = list(set(unlabeled_pool_text) - set(pairs_to_label_text))
-    
-    # --- e. Re-train the model ---
-    total_labels = len(current_clean_training_set)
-    num_positives = sum(1 for p in current_clean_training_set if p[2] == 1.0)
-    num_negatives = total_labels - num_positives
-    
-    print(f"Re-training model on {total_labels} total clean labels:")
-    print(f"  - Positives (Matches):    {num_positives}")
-    print(f"  - Negatives (No Matches): {num_negatives}")
-
-
-    model, scaler, f1, best_threshold1 = lib.train_classifier(
-        current_clean_training_set, test_set, a_lookup, b_lookup
-    )
-    
-    print(f"--- Iteration {i} F1-Score: {f1:.4f} ---")
-    
-    improvement = f1 - last_f1_score
-    if improvement < MIN_IMPROVEMENT_THRESHOLD and i > 1:
-        print(f"\nF1-Score improved by only {improvement:.4f}. Stopping Active Learning loop early.")
-        break
-    last_f1_score = f1
-
-print("\nActive Learning loop complete.")
-print(f"Final Recall Model F1-Score: {f1:.4f} at threshold {best_threshold1:.4f}")
-
-
-
-
-print("--- Starting Phase 2: Training Final Precision Model ---")
-
-# Use your new functions to train the hybrid-feature model
-# It trains on the *same* clean set, but uses *more features*
-precision_model, precision_scaler, best_f1, best_threshold2 = lib.train_precision_classifier(
-    current_clean_training_set,  # Your full, clean training set
-    test_set,                    # Your held-out test set
-    a_lookup,                    # Your lookup dict (needs 'v' and 'name')
-    b_lookup,                     # Your lookup dict (needs 'v' and 'name')
-    col="name"
-)
-
-print(f"--- Precision Model Trained! ---")
-print(f"Final F1-Score: {best_f1:.4f} at threshold {best_threshold2:.4f}")
-
-
-
-
-
-
-abt_embeddings = np.array(df_a['v'].tolist()).astype(np.float32)
-buy_embeddings = np.array(df_b['v'].tolist()).astype(np.float32)
-#amazon_id_to_index = {id_val: index for index, id_val in amazon_id_mapper.items()}
-#walmart_id_to_index = {id_val: index for index, id_val in walmart_id_mapper.items()}
-
-print("\n--- 4. Building Faiss index for Abt records ---")
-d = buy_embeddings.shape[1]
+# --- 5. Build Global FAISS Index for B (DBLP) ---
+print("Building global FAISS index...")
+d = embeddings_a.shape[1]
 index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
 index.hnsw.efConstruction = 60
 index.hnsw.efSearch = 64
-index.add(abt_embeddings)
-print(f"Index built successfully with {index.ntotal} records.")
+faiss.normalize_L2(embeddings_a) # Normalize for inner product (cosine sim)
+index.add(embeddings_a)
 
 
+# --- 6. Partitioned Active Learning Loop (The New Core) ---
+master_clean_training_set = []
+fast_validation_set = [] # <--- This will be our fixed, fast validation set
+model, scaler = (None, None) # We'll carry over the model from one loop to the next
 
-gt_lookup = {
-    (str(id1), str(id2))
-    for id1, id_list in truthD.items()
-    for id2 in id_list
-}
-print(f"Created gt_lookup set with {len(gt_lookup)} total matching pairs.")
+for i in range(N_PARTITIONS):
+    print(f"\n--- Processing Partition {i+1}/{N_PARTITIONS} ---")
+    
+    # 1. Get this partition's data
+    df_b_partition = df_b[df_b['partition'] == i]
+    if len(df_b_partition) == 0:
+        print("Partition is empty, skipping.")
+        continue
+        
+    embeddings_b_partition = np.array(df_b_partition['v'].tolist()).astype('float32')
+    faiss.normalize_L2(embeddings_b_partition) # Normalize for search
 
-#df_a, df_b, training_examples = fine_tune_on_ground_truth(df_amazon, df_walmart, text_columns, gt_lookup, id_col_a="id", id_col_b="id", model_path='./data/amazon_walmart_gt_wsss_ft_model')
-#train_classifier(df_a, df_b,  training_examples, name="amazon_walmart")
-#model_path = '/content/drive/MyDrive/data/gt_mlp_classifier_amazon_walmart.keras'
-#scaler_path = '/content/drive/MyDrive/data/gt_mlp_scaler_amazon_walmart.joblib'
-#classifier = tf.keras.models.load_model(model_path)
-#scaler = joblib.load(scaler_path)
+    # 2. Generate Candidate Pool for THIS partition
+    print(f"Generating candidate pool for {len(df_b_partition)} records...")
+    D, I = index.search(embeddings_b_partition, k=10)
+    
+    candidate_pool_text_partition = set()
+    for b_idx, a_indices_list in enumerate(I):
+        text_b = df_b_partition.iloc[b_idx]['text']
+        for a_idx in a_indices_list:
+            text_a = df_a.iloc[a_idx]['text']
+            candidate_pool_text_partition.add((text_a, text_b))
+    
+    # 3. Label and Split this partition's pool
+    labeled_pool_partition = lib.query_oracle(
+        list(candidate_pool_text_partition), a_lookup, b_lookup, gt_lookup, "id", "id"
+    )
+    random.shuffle(labeled_pool_partition)
+    
+    # --- NEW VALIDATION SET LOGIC ---
+    if not fast_validation_set:
+        # Create the fixed validation set ONCE from the first partition
+        val_set_size = int(len(labeled_pool_partition) * VAL_SET_PROPORTION)
+        if val_set_size > VAL_SET_MAX_SIZE:
+            val_set_size = VAL_SET_MAX_SIZE
+        
+        print(f"Creating a global, fixed validation set of {val_set_size} pairs.")
+        fast_validation_set = labeled_pool_partition[:val_set_size]
+        labeled_pool_partition = labeled_pool_partition[val_set_size:] # The rest is for training
+    # --- END NEW LOGIC ---
+    
+    # All pairs from this chunk (minus the val set, if it was chunk 0)
+    # are now available for the unlabeled pool
+    unlabeled_pool_text_partition = [p[:2] for p in labeled_pool_partition]
+    
+    # 4. Seed this partition's loop
+    seed_pairs_text = unlabeled_pool_text_partition[:SEED_SIZE]
+    unlabeled_pool_text_partition = unlabeled_pool_text_partition[SEED_SIZE:]
+    
+    current_clean_training_set_partition = lib.query_oracle(
+        seed_pairs_text, a_lookup, b_lookup, gt_lookup, "id", "id"
+    )
+    
+    if not current_clean_training_set_partition:
+        print("No seed labels found for this partition, skipping.")
+        continue
+        
+    # 5. Run the "mini" Active Learning Loop for this partitiona
+
+    
+ 
+    MIN_IMPROVEMENT_THRESHOLD = 0.005
+    PATIENCE = 2  # Wait for 2 *consecutive* iterations of no improvement
+    patience_counter = 0
+    last_f1_score = 0.0
+    for j in range(1, NUM_ITERATIONS_PER_PARTITION + 1):
+        print(f"  Partition {i+1}, Iteration {j}:")
+        
+        # Train on *all* labels found so far
+        training_set_for_this_iter = master_clean_training_set + current_clean_training_set_partition
+        
+        if not training_set_for_this_iter:
+            print("No training data yet. Skipping iteration.")
+            continue
+            
+        model, scaler, f1, thresh = lib.train_classifier(
+            training_set_for_this_iter, 
+            fast_validation_set,  # <--- ALWAYS use the fixed, fast validation set
+            a_lookup, b_lookup
+        )
+        print(f"  Iter {j} F1-Score: {f1:.4f}")
+        improvement = f1 - last_f1_score
+        if improvement < MIN_IMPROVEMENT_THRESHOLD and j > 1:
+           patience_counter += 1
+           print(f"F1-Score did not improve. Patience counter: {patience_counter}/{PATIENCE}")
+           if patience_counter >= PATIENCE:
+              print(f"\nF1-Score has not improved for {PATIENCE} iterations. Stopping loop early.")
+              break
+        else:
+          # If there *is* improvement, reset the patience
+            patience_counter = 0
+            last_f1_score = f1
+        
+        # --- Predict on this partition's unlabeled pool ---
+        if not unlabeled_pool_text_partition:
+            print("no unlabeled pool partition")
+            break # This partition is out of labels
+            
+        X_unlabeled_list, pairs_for_this_batch = [], []
+        for (text_a, text_b) in unlabeled_pool_text_partition:
+            record_a, record_b = a_lookup.get(text_a), b_lookup.get(text_b)
+            if record_a is not None and record_b is not None:
+                features = lib.create_pure_embedding_vector(record_a, record_b)
+                if features.shape[0] == 1536:
+                    X_unlabeled_list.append(features)
+                    pairs_for_this_batch.append((text_a, text_b))
+        
+        if not X_unlabeled_list:
+            print("no x_unlabeled list")
+            break
+            
+        X_unlabeled_matrix = np.array(X_unlabeled_list)
+        X_unlabeled_scaled = scaler.transform(X_unlabeled_matrix)
+        preds_prob = model.predict(X_unlabeled_scaled, batch_size=256).flatten()
+        
+        # --- Query (Hybrid Strategy) ---
+        half_batch = LABELS_PER_ITERATION // 2
+        confidence = np.abs(preds_prob - 0.5)
+        most_confused_indices = np.argsort(confidence)[:half_batch]
+        most_confident_indices = np.argsort(preds_prob)[-half_batch:]
+        indices_to_label = np.unique(np.concatenate([most_confused_indices, most_confident_indices]))
+        
+        if len(indices_to_label) == 0:
+            print("no indices left to label")
+            break
+            
+        pairs_to_label_text = [pairs_for_this_batch[idx] for idx in indices_to_label]
+        
+        # --- Label & Add ---
+        newly_labeled_pairs = lib.query_oracle(
+            pairs_to_label_text, a_lookup, b_lookup, gt_lookup, "id", "id"
+        )
+        current_clean_training_set_partition.extend(newly_labeled_pairs)
+        unlabeled_pool_text_partition = list(set(unlabeled_pool_text_partition) - set(pairs_to_label_text))
+
+    # --- Fuse Labels ---
+    print(f"Partition {i+1} complete. Fusing {len(current_clean_training_set_partition)} clean labels.")
+    master_clean_training_set.extend(current_clean_training_set_partition)
 
 
+print("\n--- All Partitions Complete. Fusing All Labels. ---")
+
+total_labels = len(master_clean_training_set)
+num_positives = 0
+num_negatives = 0
+
+for pair_tuple in master_clean_training_set:
+    label = pair_tuple[2]  # Get the label
+    if label == 1.0:
+        num_positives += 1
+    else:
+        num_negatives += 1
+
+print(f"--- Final Master Training Set Stats ---")
+print(f"Total Labels Collected: {total_labels}")
+print(f"  - Positives (Matches):    {num_positives}")
+print(f"  - Negatives (No Matches): {num_negatives}")
 
 
+# --- 7. Phase 3: Train Final Master Models ---
+# We use the *same* fast_validation_set for our final test
+# to be consistent with the loop.
+print("\n--- Training Master Recall Model on Fused Set ---")
+model, scaler, best_threshold1 = (None, None, 0.5)
+if master_clean_training_set:
+    model, scaler, f1, best_threshold1 = lib.train_classifier(
+        master_clean_training_set, fast_validation_set, a_lookup, b_lookup
+    )
+    print(f"Master Recall Model F1-Score: {f1:.4f}")
+else:
+    print("No clean labels gathered, skipping recall model.")
 
-k = 5 # The number of top matches to retrieve for each query
+print("\n--- Training Master Precision Model on Fused Set ---")
+precision_model, precision_scaler, best_threshold2 = (None, None, 0.5)
+if master_clean_training_set:
+    precision_model, precision_scaler, best_f1, best_threshold2 = lib.train_precision_classifier(
+         master_clean_training_set,
+         fast_validation_set,
+         a_lookup,
+         b_lookup,
+         col="name"
+    )
+    print(f"Master Precision Model F1-Score: {best_f1:.4f}")
+else:
+    print("No clean labels gathered, skipping precision model.")
 
-D, I = index.search(buy_embeddings, k)
 
-true_positives = 0
-false_positives = 0
-X_predict = []
-candidate_pairs_list = [] # Store the (record_a, record_b)
-y_true_list = []          # Store the true labels for final evaluation
-stage1_pairs_data = []
+# --- 8. Phase 4: Final Two-Stage Resolution ---
+# (This section is the same as your scholar.py script)
+# ...
+
+
+print("\n--- Starting Final Two-Stage Resolution ---")
+
+
+# 2. Search with all of df_b (DBLP)
+faiss.normalize_L2(buy_embeddings)
+D, I = index.search(buy_embeddings, k=5)
+
+# --- 3. Stage 1 (Recall Filter) ---
 X_stage1_features = []
-for buy_idx, abt_matches in enumerate(I):
-    buy_id = buy_id_mapper[buy_idx]
-    buy_embedding = buy_embeddings[buy_idx]
-    buy_record = df_b.iloc[buy_idx] # Get the full record
+stage1_pairs_data = [] # Store (scholar_record, dblp_record)
+y_true_list_stage1 = [] # Store all true labels for a *full* recall calculation
 
-    for i, abt_idx in enumerate(abt_matches):
-       abt_id = abt_id_mapper[abt_idx]
-       abt_embedding = abt_embeddings[abt_idx]
-       abt_record = df_a.iloc[abt_idx] # Get the full record
-       if abt_id in truthD:
-            v1 = {"v": abt_embedding}
-            v2 = {"v": buy_embedding}
-            stage1_pairs_data.append((abt_record, buy_record))
-            feature_vector = lib.create_pure_embedding_vector(v2 , v1 )
-            X_stage1_features.append(feature_vector) 
-            X_predict.append(feature_vector)
-            candidate_pairs_list.append((v2, v1))
-            if buy_id in truthD[abt_id]:
-                y_true_list.append(1)
-            else:
-                y_true_list.append(0)
+print("Running Stage 1 (Fast Recall)...")
+for buy_idx, abt_indices in enumerate(I):
+    buy_record = df_b_whole.iloc[buy_idx]
 
-X_matrix = np.array(X_predict)
-X_scaled = scaler.transform(X_matrix)
-all_probabilities = model.predict(X_scaled, batch_size=256)
-all_decisions_binary = (all_probabilities.flatten() > best_threshold1).astype(int)
-y_true_array = np.array(y_true_list)
-f1 = f1_score(y_true_array, all_decisions_binary)
-recall = recall_score(y_true_array, all_decisions_binary)
-precision = precision_score(y_true_array, all_decisions_binary)
-print(f"F1-Score: {f1:.4f}")
+    for abt_idx in abt_indices:
+        abt_record = df_a.iloc[abt_idx]
+
+        # Add to lists
+        stage1_pairs_data.append((abt_record, buy_record))
+        X_stage1_features.append(lib.create_pure_embedding_vector(abt_record, buy_record))
+
+        # Get true label for this pair
+        abt_id = str(abt_record["id"])
+        buy_id = str(buy_record["id"])
+        y_true_list_stage1.append(1.0 if (abt_id, buy_id) in gt_lookup else 0.0)
+
+X_stage1_matrix = np.array(X_stage1_features)
+X_stage1_scaled = scaler.transform(X_stage1_matrix)
+stage1_probs = model.predict(X_stage1_scaled, batch_size=256).flatten()
+stage1_decisions = (stage1_probs > best_threshold1).astype(int)
+y_true_stage1_array = np.array(y_true_list_stage1)
+
+print("\n--- Stage 1 (Recall Model) Performance on ALL Candidates ---")
+#print(classification_report(y_true_stage1_array, stage1_decisions, target_names=["No Match", "Match"]))
+f1 = f1_score(y_true_stage1_array, stage1_decisions)
+recall = recall_score(y_true_stage1_array,  stage1_decisions)
+precision = precision_score(y_true_stage1_array,  stage1_decisions)
+print(f"F1-score: {f1:.4f}")
 print(f"Recall: {recall:.4f}")
 print(f"Precision: {precision:.4f}")
 
 
-
-
-
-
-stage1_probs = model.predict(X_scaled, batch_size=256).flatten()
-
-# --- STAGE 1 FILTERING ---
-# Find all pairs that pass our low-recall threshold
-stage2_candidate_indices = np.where(stage1_probs > best_threshold1 )[0]
+# --- 4. Stage 2 (Precision Filter) ---
+stage2_candidate_indices = np.where(stage1_probs > best_threshold1)[0]
 print(f"Stage 1 found {len(stage2_candidate_indices)} high-recall candidates.")
 
-# --- STAGE 2: PRECISION FILTERING ---
 if len(stage2_candidate_indices) > 0:
     X_stage2_features = []
-    y_true_list = [] # For final scoring
-    
+    y_true_list_stage2 = [] # For final scoring
+
     print("Running Stage 2 (Smart Precision)...")
     for idx in stage2_candidate_indices:
-        # Get the record pair we saved
         abt_record, buy_record = stage1_pairs_data[idx]
-        
-        # Create the SLOW, HYBRID (embedding + jaro) feature vector
-        hybrid_features = lib.create_hybrid_feature_vector(abt_record, buy_record)
+
+        # Create the SLOW, HYBRID feature vector
+        hybrid_features = lib.create_hybrid_feature_vector(abt_record, buy_record, col="name")
         X_stage2_features.append(hybrid_features)
-        
-        # Get the true label for our final test
-        abt_id = str(abt_record["id"])
-        buy_id = str(buy_record["id"])
-        y_true_list.append(1.0 if (abt_id, buy_id) in gt_lookup else 0.0)
+
+        # Get the true label
+        y_true_list_stage2.append(y_true_list_stage1[idx]) # Get label from our pre-built list
 
     # --- STAGE 2 PREDICTION ---
     X_stage2_matrix = np.array(X_stage2_features)
     X_stage2_scaled = precision_scaler.transform(X_stage2_matrix)
     stage2_probs = precision_model.predict(X_stage2_scaled, batch_size=256).flatten()
-    
-    # Use the high, optimal threshold from the precision model
+
     stage2_decisions = (stage2_probs > best_threshold2).astype(int)
-    y_true_array = np.array(y_true_list)
-    
+    y_true_stage2_array = np.array(y_true_list_stage2)
+
     # --- FINAL RESULTS ---
-    print("\n--- Final Two-Stage Model Performance ---")
-    print(f"(Using {len(stage2_decisions)} pairs from Stage 1)")
-    f1 = f1_score(y_true_array, stage2_decisions)
-    recall = recall_score(y_true_array,  stage2_decisions)
-    precision = precision_score(y_true_array,  stage2_decisions)
+    print("\n--- Final Two-Stage Model Performance (on Stage 1 Candidates) ---")
+    #print(classification_report(y_true_stage2_array, stage2_decisions, target_names=["No Match", "Match"]))
+    f1 = f1_score(y_true_stage2_array, stage2_decisions)
+    recall = recall_score(y_true_stage2_array,  stage2_decisions)
+    precision = precision_score(y_true_stage2_array,  stage2_decisions)
     print(f"F1-score: {f1:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"Precision: {precision:.4f}")
 
 
- 
-
-
-
-
-
-
-
-
+else:
+    print("Stage 1 found no candidates.")
 
