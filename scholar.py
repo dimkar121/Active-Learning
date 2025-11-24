@@ -6,6 +6,7 @@ import faiss
 from tqdm import tqdm
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
 from sklearn.cluster import MiniBatchKMeans
+import time
 
 # --- 1. Configuration & Setup ---
 
@@ -84,6 +85,7 @@ index.hnsw.efSearch = 64
 faiss.normalize_L2(embeddings_a) # Normalize for inner product (cosine sim)
 index.add(embeddings_a)
 
+time_start_training = time.time()
 
 # --- 6. Partitioned Active Learning Loop (The New Core) ---
 master_clean_training_set = []
@@ -246,6 +248,14 @@ else:
 # ...
 
 
+time_end_training = time.time()
+time1 = time_end_training - time_start_training
+print(f"Training Time {time1} seconds.")
+
+
+
+time_start_res = time.time()
+
 print("\n--- Starting Final Two-Stage Resolution ---")
 
 # 1. Build the *global* FAISS index for df_a (Scholar)
@@ -338,4 +348,8 @@ if len(stage2_candidate_indices) > 0:
 
 else:
     print("Stage 1 found no candidates.")
+
+time_end_res = time.time()
+time1 = time_end_res - time_start_res
+print(f"Resolution Time {time1} seconds.")
 

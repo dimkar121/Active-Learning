@@ -10,10 +10,9 @@ from sklearn.cluster import MiniBatchKMeans
 # --- 1. Configuration & Setup ---
 
 # --- Scalability Settings ---
-N_PARTITIONS = 5 # Split the dataset into 20 chunks
 NUM_ITERATIONS_PER_PARTITION = 4 # Run 3 AL iterations on each chunk
-LABELS_PER_ITERATION = 600 # Query 200 labels per iteration
-SEED_SIZE = 500             # Seed each partition's loop with 20 labels
+LABELS_PER_ITERATION = 200 # Query 200 labels per iteration
+SEED_SIZE = 200             # Seed each partition's loop with 20 labels
 
 # --- NEW: Validation Set Configuration ---
 # We create one fixed, fast validation set.
@@ -39,6 +38,10 @@ df_a_raw = pd.read_csv(PATH_RAW_A, encoding='unicode_escape')
 df_b_raw = pd.read_csv(PATH_RAW_B, encoding='unicode_escape')
 df_gt = pd.read_csv(PATH_GT, sep="\t", encoding="unicode_escape", keep_default_na=False)
 
+SAMPLE_PROPORTION = 0.2
+SAMPLE_SIZE= int(len(df_a_raw) * SAMPLE_PROPORTION)
+N_PARTITIONS = int(np.log10(SAMPLE_SIZE))
+print(f"N={N_PARTITIONS} chunks")
 
 df_a, df_b = lib.bootstrap_embeddings_only(
        df_a_raw, df_b_raw, "source_a", "source_b", COLS_TO_USE
@@ -89,8 +92,6 @@ gt_lookup = {
 
 a_embeddings = np.array(df_a['v'].tolist()).astype('float32')
 df_a_whole  = df_a
-SAMPLE_PROPORTION = 0.3
-SAMPLE_SIZE= int(len(df_a) * SAMPLE_PROPORTION)
 df_a = df_a.sample(n=SAMPLE_SIZE, random_state=42)
 
 # Create fast lookup dicts (text -> full record)

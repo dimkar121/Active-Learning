@@ -6,29 +6,29 @@ import faiss
 from tqdm import tqdm
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
 from sklearn.cluster import MiniBatchKMeans
-import time
+
 # --- 1. Configuration & Setup ---
 
 # --- Scalability Settings ---
-NUM_ITERATIONS_PER_PARTITION = 5 # Run 3 AL iterations on each chunk
+N_PARTITIONS = 3 # Split the dataset into 20 chunks
+NUM_ITERATIONS_PER_PARTITION = 8 # Run 3 AL iterations on each chunk
 LABELS_PER_ITERATION = 200 # Query 200 labels per iteration
-SEED_SIZE = 200             # Seed each partition's loop with 20 labels
+SEED_SIZE = 100             # Seed each partition's loop with 20 labels
 
 # --- NEW: Validation Set Configuration ---
 # We create one fixed, fast validation set.
 # We'll make it proportional to the *first* partition's candidate pool,
 # but cap it to ensure it's always fast.
-VAL_SET_PROPORTION = 0.2
+VAL_SET_PROPORTION = 0.1
 VAL_SET_MAX_SIZE = 20000  # Cap at 20,000 pairs
 
 # --- Data paths and columns ---
-
-PATH_RAW_A = './data/Abt.csv'
-PATH_RAW_B = './data/Buy.csv'
-PATH_GT = './data/truth_abt_buy.csv'
-ID_COL_A = 'idAbt'
-ID_COL_B = 'idBuy'
-COLS_TO_USE = ['name', 'description', 'price'] # The columns to build the 'text' from
+PATH_RAW_A = './data/fodors.csv'
+PATH_RAW_B = './data/zagats.csv'
+PATH_GT = './data/truth_fodors_zagats.csv'
+ID_COL_A = 'idFodors'
+ID_COL_B = 'idZagats'
+COLS_TO_USE = [ "name","address","city","phone","type" ] # The columns to build the 'text' from
 
 
 # --- 1. Load Data and Oracle ---
@@ -41,17 +41,12 @@ df_gt = pd.read_csv(PATH_GT, encoding="unicode_escape", keep_default_na=False)
 truthD = dict()
 a = 0
 for i, r in df_gt.iterrows():
-     idAbt = r["idAbt"]
-     idBuy = r["idBuy"]
-     if idAbt in truthD:
-           ids = truthD[idAbt]
-           ids.append(idBuy)
-           a += 1
-     else:
-          truthD[idAbt] = [idBuy]
-          a += 1
-matches =  a
+    idFodors = r["idFodors"]
+    idZagats = r["idZagats"]
+    truthD[idFodors] = [idZagats]
+matches = len(truthD.keys())
 print("No of matches=", matches)
+
 
 gt_lookup = {
     (str(key), str(value))
@@ -60,20 +55,18 @@ gt_lookup = {
 }
 print(f"Loaded Oracle with {len(gt_lookup)} total matches.")
 
-SAMPLE_PROPORTION = 0.3
-SAMPLE_SIZE= int(len(df_b_raw) * SAMPLE_PROPORTION)
-N_PARTITIONS = int(np.log10(SAMPLE_SIZE))
-print(f"N={N_PARTITIONS} chunks")
-
 # --- 3. Bootstrap Embeddings (Phase 1) ---
 df_a, df_b = lib.bootstrap_embeddings_only(
       df_a_raw, df_b_raw, "source_a", "source_b", COLS_TO_USE
 )
 
 
-buy_embeddings = np.array(df_b['v'].tolist()).astype('float32')
-df_b_whole  = df_b
-df_b = df_b.sample(n=SAMPLE_SIZE, random_state=42)
+zagats_embeddings = np.array(df_b['v'].tolist()).astype('float32')
+fodors_embeddings = np.array(df_a['v'].tolist()).astype('float32')
+df_a_whole  = df_a
+SAMPLE_PROPORTION = 0.3
+SAMPLE_SIZE= int(len(df_b) * SAMPLE_PROPORTION)
+df_a = df_a.sample(n=SAMPLE_SIZE, random_state=42)
 
 # Create fast lookup dicts (text -> full record)
 a_lookup = {row['text']: row for _, row in df_a.iterrows()}
@@ -84,7 +77,7 @@ print(f"\n--- Partitioning data into {N_PARTITIONS} chunks using KMeans ---")
 embeddings_a = np.array(df_a['v'].tolist()).astype('float32')
 embeddings_b = np.array(df_b['v'].tolist()).astype('float32')
 kmeans = MiniBatchKMeans(n_clusters=N_PARTITIONS, random_state=42, batch_size=256, n_init=3)
-df_b['partition'] = kmeans.fit_predict(embeddings_b)
+df_a['partition'] = kmeans.fit_predict(embeddings_a)
 
 # --- 5. Build Global FAISS Index for B (DBLP) ---
 print("Building global FAISS index...")
@@ -92,8 +85,8 @@ d = embeddings_a.shape[1]
 index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
 index.hnsw.efConstruction = 60
 index.hnsw.efSearch = 64
-faiss.normalize_L2(embeddings_a) # Normalize for inner product (cosine sim)
-index.add(embeddings_a)
+faiss.normalize_L2(zagats_embeddings) # Normalize for inner product (cosine sim)
+index.add(zagats_embeddings)
 
 
 # --- 6. Partitioned Active Learning Loop (The New Core) ---
@@ -101,28 +94,27 @@ master_clean_training_set = []
 fast_validation_set = [] # <--- This will be our fixed, fast validation set
 model, scaler = (None, None) # We'll carry over the model from one loop to the next
 
-time_start_training = time.time()
 for i in range(N_PARTITIONS):
     print(f"\n--- Processing Partition {i+1}/{N_PARTITIONS} ---")
     
     # 1. Get this partition's data
-    df_b_partition = df_b[df_b['partition'] == i]
-    if len(df_b_partition) == 0:
+    df_a_partition = df_a[df_a['partition'] == i]
+    if len(df_a_partition) == 0:
         print("Partition is empty, skipping.")
         continue
         
-    embeddings_b_partition = np.array(df_b_partition['v'].tolist()).astype('float32')
-    faiss.normalize_L2(embeddings_b_partition) # Normalize for search
+    embeddings_a_partition = np.array(df_a_partition['v'].tolist()).astype('float32')
+    faiss.normalize_L2(embeddings_a_partition) # Normalize for search
 
     # 2. Generate Candidate Pool for THIS partition
-    print(f"Generating candidate pool for {len(df_b_partition)} records...")
-    D, I = index.search(embeddings_b_partition, k=10)
+    print(f"Generating candidate pool for {len(df_a_partition)} records...")
+    D, I = index.search(embeddings_a_partition, k=10)
     
     candidate_pool_text_partition = set()
-    for b_idx, a_indices_list in enumerate(I):
-        text_b = df_b_partition.iloc[b_idx]['text']
-        for a_idx in a_indices_list:
-            text_a = df_a.iloc[a_idx]['text']
+    for a_idx, b_indices_list in enumerate(I):
+        text_a = df_a_partition.iloc[a_idx]['text']
+        for b_idx in b_indices_list:
+            text_b = df_b.iloc[b_idx]['text']
             candidate_pool_text_partition.add((text_a, text_b))
     
     # 3. Label and Split this partition's pool
@@ -163,7 +155,7 @@ for i in range(N_PARTITIONS):
 
     
  
-    MIN_IMPROVEMENT_THRESHOLD = 0.05
+    MIN_IMPROVEMENT_THRESHOLD = 0.005
     PATIENCE = 2  # Wait for 2 *consecutive* iterations of no improvement
     patience_counter = 0
     last_f1_score = 0.0
@@ -293,21 +285,13 @@ else:
 # (This section is the same as your scholar.py script)
 # ...
 
-time_end_training = time.time()
-time1 = time_end_training - time_start_training
-print(f"Training Time {time1} seconds.")
-
-
-
-
-time_start_res = time.time()
 
 print("\n--- Starting Final Two-Stage Resolution ---")
 
 
 # 2. Search with all of df_b (DBLP)
-faiss.normalize_L2(buy_embeddings)
-D, I = index.search(buy_embeddings, k=5)
+faiss.normalize_L2(fodors_embeddings)
+D, I = index.search(fodors_embeddings, k=5)
 
 # --- 3. Stage 1 (Recall Filter) ---
 X_stage1_features = []
@@ -315,20 +299,20 @@ stage1_pairs_data = [] # Store (scholar_record, dblp_record)
 y_true_list_stage1 = [] # Store all true labels for a *full* recall calculation
 
 print("Running Stage 1 (Fast Recall)...")
-for buy_idx, abt_indices in enumerate(I):
-    buy_record = df_b_whole.iloc[buy_idx]
+for fodors_idx, zagats_indices in enumerate(I):
+    fodors_record = df_a_whole.iloc[fodors_idx]
 
-    for abt_idx in abt_indices:
-        abt_record = df_a.iloc[abt_idx]
+    for zagats_idx in zagats_indices:
+        zagats_record = df_b.iloc[zagats_idx]
 
         # Add to lists
-        stage1_pairs_data.append((abt_record, buy_record))
-        X_stage1_features.append(lib.create_pure_embedding_vector(abt_record, buy_record))
+        stage1_pairs_data.append((fodors_record, zagats_record))
+        X_stage1_features.append(lib.create_pure_embedding_vector(fodors_record, zagats_record))
 
         # Get true label for this pair
-        abt_id = str(abt_record["id"])
-        buy_id = str(buy_record["id"])
-        y_true_list_stage1.append(1.0 if (abt_id, buy_id) in gt_lookup else 0.0)
+        fodors_id = str(fodors_record["id"])
+        zagats_id = str(zagats_record["id"])
+        y_true_list_stage1.append(1.0 if (fodors_id, zagats_id) in gt_lookup else 0.0)
 
 X_stage1_matrix = np.array(X_stage1_features)
 X_stage1_scaled = scaler.transform(X_stage1_matrix)
@@ -356,10 +340,10 @@ if len(stage2_candidate_indices) > 0:
 
     print("Running Stage 2 (Smart Precision)...")
     for idx in stage2_candidate_indices:
-        abt_record, buy_record = stage1_pairs_data[idx]
+        amazon_record, google_record = stage1_pairs_data[idx]
 
         # Create the SLOW, HYBRID feature vector
-        hybrid_features = lib.create_hybrid_feature_vector(abt_record, buy_record, col="name")
+        hybrid_features = lib.create_hybrid_feature_vector(amazon_record, google_record, col="name")
         X_stage2_features.append(hybrid_features)
 
         # Get the true label
@@ -379,16 +363,11 @@ if len(stage2_candidate_indices) > 0:
     f1 = f1_score(y_true_stage2_array, stage2_decisions)
     recall = recall_score(y_true_stage2_array,  stage2_decisions)
     precision = precision_score(y_true_stage2_array,  stage2_decisions)
-    print(f"F1-score: {f1:.4f} @{best_threshold2}")
+    print(f"F1-score: {f1:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"Precision: {precision:.4f}")
 
 
 else:
     print("Stage 1 found no candidates.")
-
-
-time_end_res = time.time()
-time1 = time_end_res - time_start_res
-print(f"Resolution Time {time1} seconds.")
 

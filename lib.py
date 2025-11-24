@@ -16,8 +16,6 @@ from sklearn.metrics import f1_score, precision_score, recall_score, classificat
 from sentence_transformers import SentenceTransformer, InputExample, losses
 from sklearn.feature_extraction.text import TfidfVectorizer
 from torch.utils.data import DataLoader
-import leidenalg
-import igraph as ig
 from sentence_transformers import SentenceTransformer, InputExample, losses
 from torch.utils.data import DataLoader
 import math

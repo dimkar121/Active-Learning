@@ -7,52 +7,46 @@ from tqdm import tqdm
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
 from sklearn.cluster import MiniBatchKMeans
 import time
+
 # --- 1. Configuration & Setup ---
 
 # --- Scalability Settings ---
-NUM_ITERATIONS_PER_PARTITION = 5 # Run 3 AL iterations on each chunk
+N_PARTITIONS = 5 # Split the dataset into 20 chunks
+NUM_ITERATIONS_PER_PARTITION = 8 # Run 3 AL iterations on each chunk
 LABELS_PER_ITERATION = 200 # Query 200 labels per iteration
-SEED_SIZE = 200             # Seed each partition's loop with 20 labels
+SEED_SIZE = 1000             # Seed each partition's loop with 20 labels
 
 # --- NEW: Validation Set Configuration ---
 # We create one fixed, fast validation set.
 # We'll make it proportional to the *first* partition's candidate pool,
 # but cap it to ensure it's always fast.
-VAL_SET_PROPORTION = 0.2
+VAL_SET_PROPORTION = 0.1
 VAL_SET_MAX_SIZE = 20000  # Cap at 20,000 pairs
 
 # --- Data paths and columns ---
+PATH_RAW_A = './data/test_voters_A.txt'
+PATH_RAW_B = './data/test_voters_B.txt'
+PATH_GT = './data/truth_VOTERS.csv'
+ID_COL_A = 'id1'
+ID_COL_B = 'id2'
+COLS_TO_USE = [ "surname", "name", "address" ,"town" ,"ps" ]
 
-PATH_RAW_A = './data/Abt.csv'
-PATH_RAW_B = './data/Buy.csv'
-PATH_GT = './data/truth_abt_buy.csv'
-ID_COL_A = 'idAbt'
-ID_COL_B = 'idBuy'
-COLS_TO_USE = ['name', 'description', 'price'] # The columns to build the 'text' from
-
-
-# --- 1. Load Data and Oracle ---
+# --- 2. Load Data and Oracle ---
 print("--- Loading Raw Data and Oracle ---")
-df_a_raw = pd.read_csv(PATH_RAW_A, encoding='unicode_escape')
-df_b_raw = pd.read_csv(PATH_RAW_B, encoding='unicode_escape')
-df_gt = pd.read_csv(PATH_GT, encoding="unicode_escape", keep_default_na=False)
+cols=["id", "surname", "name", "address" ,"town" ,"ps" ]
+df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="unicode_escape",names=cols, on_bad_lines='skip' )
+df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="unicode_escape",names=cols, on_bad_lines='skip' )
+df_gt = pd.read_csv(PATH_GT, encoding="utf-8",   keep_default_na=False)
 
-
+# Build the Oracle (gt_lookup)
 truthD = dict()
-a = 0
 for i, r in df_gt.iterrows():
-     idAbt = r["idAbt"]
-     idBuy = r["idBuy"]
-     if idAbt in truthD:
-           ids = truthD[idAbt]
-           ids.append(idBuy)
-           a += 1
-     else:
-          truthD[idAbt] = [idBuy]
-          a += 1
-matches =  a
-print("No of matches=", matches)
+     id1 = r["id1"]
+     id2 = [r["id2"]]        
+     truthD[id1] = id2
 
+matches = len(truthD.keys()) 
+print("total matches=",matches)
 gt_lookup = {
     (str(key), str(value))
     for key, value_list in truthD.items()
@@ -60,10 +54,6 @@ gt_lookup = {
 }
 print(f"Loaded Oracle with {len(gt_lookup)} total matches.")
 
-SAMPLE_PROPORTION = 0.3
-SAMPLE_SIZE= int(len(df_b_raw) * SAMPLE_PROPORTION)
-N_PARTITIONS = int(np.log10(SAMPLE_SIZE))
-print(f"N={N_PARTITIONS} chunks")
 
 # --- 3. Bootstrap Embeddings (Phase 1) ---
 df_a, df_b = lib.bootstrap_embeddings_only(
@@ -71,8 +61,10 @@ df_a, df_b = lib.bootstrap_embeddings_only(
 )
 
 
-buy_embeddings = np.array(df_b['v'].tolist()).astype('float32')
+b_embeddings = np.array(df_b['v'].tolist()).astype('float32')
 df_b_whole  = df_b
+SAMPLE_PROPORTION = 0.3
+SAMPLE_SIZE= int(len(df_b) * SAMPLE_PROPORTION)
 df_b = df_b.sample(n=SAMPLE_SIZE, random_state=42)
 
 # Create fast lookup dicts (text -> full record)
@@ -96,12 +88,12 @@ faiss.normalize_L2(embeddings_a) # Normalize for inner product (cosine sim)
 index.add(embeddings_a)
 
 
+st = time.time()
 # --- 6. Partitioned Active Learning Loop (The New Core) ---
 master_clean_training_set = []
 fast_validation_set = [] # <--- This will be our fixed, fast validation set
 model, scaler = (None, None) # We'll carry over the model from one loop to the next
 
-time_start_training = time.time()
 for i in range(N_PARTITIONS):
     print(f"\n--- Processing Partition {i+1}/{N_PARTITIONS} ---")
     
@@ -159,14 +151,7 @@ for i in range(N_PARTITIONS):
         print("No seed labels found for this partition, skipping.")
         continue
         
-    # 5. Run the "mini" Active Learning Loop for this partitiona
-
-    
- 
-    MIN_IMPROVEMENT_THRESHOLD = 0.05
-    PATIENCE = 2  # Wait for 2 *consecutive* iterations of no improvement
-    patience_counter = 0
-    last_f1_score = 0.0
+    # 5. Run the "mini" Active Learning Loop for this partition
     for j in range(1, NUM_ITERATIONS_PER_PARTITION + 1):
         print(f"  Partition {i+1}, Iteration {j}:")
         
@@ -183,21 +168,9 @@ for i in range(N_PARTITIONS):
             a_lookup, b_lookup
         )
         print(f"  Iter {j} F1-Score: {f1:.4f}")
-        improvement = f1 - last_f1_score
-        if improvement < MIN_IMPROVEMENT_THRESHOLD and j > 1:
-           patience_counter += 1
-           print(f"F1-Score did not improve. Patience counter: {patience_counter}/{PATIENCE}")
-           if patience_counter >= PATIENCE:
-              print(f"\nF1-Score has not improved for {PATIENCE} iterations. Stopping loop early.")
-              break
-        else:
-          # If there *is* improvement, reset the patience
-            patience_counter = 0
-            last_f1_score = f1
         
         # --- Predict on this partition's unlabeled pool ---
         if not unlabeled_pool_text_partition:
-            print("no unlabeled pool partition")
             break # This partition is out of labels
             
         X_unlabeled_list, pairs_for_this_batch = [], []
@@ -210,7 +183,6 @@ for i in range(N_PARTITIONS):
                     pairs_for_this_batch.append((text_a, text_b))
         
         if not X_unlabeled_list:
-            print("no x_unlabeled list")
             break
             
         X_unlabeled_matrix = np.array(X_unlabeled_list)
@@ -225,7 +197,6 @@ for i in range(N_PARTITIONS):
         indices_to_label = np.unique(np.concatenate([most_confused_indices, most_confident_indices]))
         
         if len(indices_to_label) == 0:
-            print("no indices left to label")
             break
             
         pairs_to_label_text = [pairs_for_this_batch[idx] for idx in indices_to_label]
@@ -243,23 +214,8 @@ for i in range(N_PARTITIONS):
 
 
 print("\n--- All Partitions Complete. Fusing All Labels. ---")
-
-total_labels = len(master_clean_training_set)
-num_positives = 0
-num_negatives = 0
-
-for pair_tuple in master_clean_training_set:
-    label = pair_tuple[2]  # Get the label
-    if label == 1.0:
-        num_positives += 1
-    else:
-        num_negatives += 1
-
-print(f"--- Final Master Training Set Stats ---")
-print(f"Total Labels Collected: {total_labels}")
-print(f"  - Positives (Matches):    {num_positives}")
-print(f"  - Negatives (No Matches): {num_negatives}")
-
+print(f"Total clean labels gathered: {len(master_clean_training_set)}")
+print(f"Total validation set size: {len(fast_validation_set)}")
 
 # --- 7. Phase 3: Train Final Master Models ---
 # We use the *same* fast_validation_set for our final test
@@ -282,53 +238,59 @@ if master_clean_training_set:
          fast_validation_set,
          a_lookup,
          b_lookup,
-         col="name"
+         col="title"
     )
     print(f"Master Precision Model F1-Score: {best_f1:.4f}")
 else:
     print("No clean labels gathered, skipping precision model.")
 
 
+end = time.time()
+time1 = end - st
+print(f"Training time {time1} seconds")
+
+
 # --- 8. Phase 4: Final Two-Stage Resolution ---
 # (This section is the same as your scholar.py script)
 # ...
 
-time_end_training = time.time()
-time1 = time_end_training - time_start_training
-print(f"Training Time {time1} seconds.")
-
-
-
-
-time_start_res = time.time()
 
 print("\n--- Starting Final Two-Stage Resolution ---")
 
+# 1. Build the *global* FAISS index for df_a (Scholar)
+#print(f"Building final FAISS index for Scholar (df_a)...")
+a_embeddings = np.array(df_a['v'].tolist()).astype(np.float32)
+#d = scholar_embeddings.shape[1]
+#index_a = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
+#faiss.normalize_L2(scholar_embeddings)
+#index_a.add(scholar_embeddings)
+#print(f"Index built successfully with {index_a.ntotal} records.")
 
 # 2. Search with all of df_b (DBLP)
-faiss.normalize_L2(buy_embeddings)
-D, I = index.search(buy_embeddings, k=5)
+faiss.normalize_L2(b_embeddings)
+D, I = index.search(b_embeddings, k=5)
 
 # --- 3. Stage 1 (Recall Filter) ---
 X_stage1_features = []
-stage1_pairs_data = [] # Store (scholar_record, dblp_record)
+stage1_pairs_data = [] # Store (a_record, b_record)
 y_true_list_stage1 = [] # Store all true labels for a *full* recall calculation
 
+st = time.time()
 print("Running Stage 1 (Fast Recall)...")
-for buy_idx, abt_indices in enumerate(I):
-    buy_record = df_b_whole.iloc[buy_idx]
+for b_idx, a_indices in enumerate(I):
+    b_record = df_b_whole.iloc[b_idx]
 
-    for abt_idx in abt_indices:
-        abt_record = df_a.iloc[abt_idx]
+    for a_idx in a_indices:
+        a_record = df_a.iloc[a_idx]
 
         # Add to lists
-        stage1_pairs_data.append((abt_record, buy_record))
-        X_stage1_features.append(lib.create_pure_embedding_vector(abt_record, buy_record))
+        stage1_pairs_data.append((a_record, b_record))
+        X_stage1_features.append(lib.create_pure_embedding_vector(a_record, b_record))
 
         # Get true label for this pair
-        abt_id = str(abt_record["id"])
-        buy_id = str(buy_record["id"])
-        y_true_list_stage1.append(1.0 if (abt_id, buy_id) in gt_lookup else 0.0)
+        a_id = str(a_record["id"])
+        b_id = str(b_record["id"])
+        y_true_list_stage1.append(1.0 if (a_id, b_id) in gt_lookup else 0.0)
 
 X_stage1_matrix = np.array(X_stage1_features)
 X_stage1_scaled = scaler.transform(X_stage1_matrix)
@@ -356,10 +318,10 @@ if len(stage2_candidate_indices) > 0:
 
     print("Running Stage 2 (Smart Precision)...")
     for idx in stage2_candidate_indices:
-        abt_record, buy_record = stage1_pairs_data[idx]
+        a_record, b_record = stage1_pairs_data[idx]
 
         # Create the SLOW, HYBRID feature vector
-        hybrid_features = lib.create_hybrid_feature_vector(abt_record, buy_record, col="name")
+        hybrid_features = lib.create_hybrid_feature_vector(a_record, b_record, col="title")
         X_stage2_features.append(hybrid_features)
 
         # Get the true label
@@ -379,7 +341,7 @@ if len(stage2_candidate_indices) > 0:
     f1 = f1_score(y_true_stage2_array, stage2_decisions)
     recall = recall_score(y_true_stage2_array,  stage2_decisions)
     precision = precision_score(y_true_stage2_array,  stage2_decisions)
-    print(f"F1-score: {f1:.4f} @{best_threshold2}")
+    print(f"F1-score: {f1:.4f}")
     print(f"Recall: {recall:.4f}")
     print(f"Precision: {precision:.4f}")
 
@@ -388,7 +350,7 @@ else:
     print("Stage 1 found no candidates.")
 
 
-time_end_res = time.time()
-time1 = time_end_res - time_start_res
-print(f"Resolution Time {time1} seconds.")
+end = time.time()
+time1 = end - st
+print(f"Resolution time {time1} seconds")
 

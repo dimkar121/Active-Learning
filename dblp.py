@@ -6,13 +6,14 @@ import faiss
 from tqdm import tqdm
 from sklearn.metrics import f1_score, precision_score, recall_score, classification_report
 from sklearn.cluster import MiniBatchKMeans
+import time
 
 # --- 1. Configuration & Setup ---
 
 # --- Scalability Settings ---
-N_PARTITIONS = 8 # Split the dataset into 20 chunks
-NUM_ITERATIONS_PER_PARTITION = 5 # Run 3 AL iterations on each chunk
-LABELS_PER_ITERATION = 1000 # Query 200 labels per iteration
+N_PARTITIONS = 7 # Split the dataset into 20 chunks
+NUM_ITERATIONS_PER_PARTITION = 4 # Run 3 AL iterations on each chunk
+LABELS_PER_ITERATION = 300 # Query 200 labels per iteration
 SEED_SIZE = 1000             # Seed each partition's loop with 20 labels
 
 # --- NEW: Validation Set Configuration ---
@@ -33,9 +34,9 @@ COLS_TO_USE = ["author1","author2","title","year"]
 # --- 2. Load Data and Oracle ---
 print("--- Loading Raw Data and Oracle ---")
 cols=["id","author1","author2","title","year"]
-df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip', nrows=200_000 )
-df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip', nrows=200_000 )
-df_gt = pd.read_csv(PATH_GT, encoding="utf-8", nrows=100_000,  keep_default_na=False)
+df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip' )
+df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip' )
+df_gt = pd.read_csv(PATH_GT, encoding="utf-8",  keep_default_na=False)
 
 # Build the Oracle (gt_lookup)
 truthD = dict()
@@ -83,10 +84,21 @@ d = embeddings_a.shape[1]
 index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
 index.hnsw.efConstruction = 60
 index.hnsw.efSearch = 64
-faiss.normalize_L2(embeddings_a) # Normalize for inner product (cosine sim)
-index.add(embeddings_a)
+BATCH_SIZE = 1_000
+for i in tqdm(range(0, len(embeddings_a), BATCH_SIZE)):
+    # Slice the batch
+    batch = embeddings_a[i : i + BATCH_SIZE]    
+    # Normalize BATCH (if using Inner Product/Cosine)
+    faiss.normalize_L2(batch)    
+    # Add to index
+    index.add(batch)
+
+print(f"Index built. Total vectors: {index.ntotal}")
+#faiss.normalize_L2(embeddings_a) # Normalize for inner product (cosine sim)
+#index.add(embeddings_a)
 
 
+st = time.time()
 # --- 6. Partitioned Active Learning Loop (The New Core) ---
 master_clean_training_set = []
 fast_validation_set = [] # <--- This will be our fixed, fast validation set
@@ -243,6 +255,11 @@ else:
     print("No clean labels gathered, skipping precision model.")
 
 
+end = time.time()
+time1 = end - st
+print(f"Training time {time1} seconds")
+
+
 # --- 8. Phase 4: Final Two-Stage Resolution ---
 # (This section is the same as your scholar.py script)
 # ...
@@ -252,92 +269,130 @@ print("\n--- Starting Final Two-Stage Resolution ---")
 
 # 1. Build the *global* FAISS index for df_a (Scholar)
 #print(f"Building final FAISS index for Scholar (df_a)...")
-a_embeddings = np.array(df_a['v'].tolist()).astype(np.float32)
-#d = scholar_embeddings.shape[1]
-#index_a = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
-#faiss.normalize_L2(scholar_embeddings)
-#index_a.add(scholar_embeddings)
-#print(f"Index built successfully with {index_a.ntotal} records.")
+#a_embeddings = np.array(df_a['v'].tolist()).astype(np.float32)
 
-# 2. Search with all of df_b (DBLP)
-faiss.normalize_L2(b_embeddings)
-D, I = index.search(b_embeddings, k=5)
+print(f"Resolving {len(b_embeddings)} records in batches of {BATCH_SIZE}...")
 
-# --- 3. Stage 1 (Recall Filter) ---
-X_stage1_features = []
-stage1_pairs_data = [] # Store (a_record, b_record)
-y_true_list_stage1 = [] # Store all true labels for a *full* recall calculation
+final_matches = []        # Store the final (record_a, record_b) matches
+y_true_final = []         # Store true labels for metrics (optional)
 
-print("Running Stage 1 (Fast Recall)...")
-for b_idx, a_indices in enumerate(I):
-    b_record = df_b_whole.iloc[b_idx]
-
-    for a_idx in a_indices:
-        a_record = df_a.iloc[a_idx]
-
-        # Add to lists
-        stage1_pairs_data.append((a_record, b_record))
-        X_stage1_features.append(lib.create_pure_embedding_vector(a_record, b_record))
-
-        # Get true label for this pair
-        a_id = str(a_record["id"])
+# Iterate through B (Query Side)
+for start_idx in tqdm(range(0, len(b_embeddings), BATCH_SIZE), desc="Resolving"):
+    end_idx = min(start_idx + BATCH_SIZE, len(b_embeddings))
+    
+    # A. Get Batch of Query Vectors
+    query_batch = b_embeddings[start_idx:end_idx]
+    
+    # B. Search Index
+    # D_batch: distances, I_batch: indices of neighbors in df_a
+    D_batch, I_batch = index.search(query_batch, 5)
+    
+    # C. Build Prediction Matrix for THIS Batch Only
+    X_batch_features = []
+    batch_pairs_metadata = [] # To track which records correspond to which row in X
+    batch_labels = []         # To track ground truth for this batch
+    
+    for local_i in range(len(query_batch)):
+        # Reconstruct global index for B
+        global_b_idx = start_idx + local_i
+        
+        # Get Record B
+        b_record = df_b_whole.iloc[global_b_idx]
         b_id = str(b_record["id"])
-        y_true_list_stage1.append(1.0 if (a_id, b_id) in gt_lookup else 0.0)
+        
+        # Iterate through its neighbors (from A)
+        for neighbor_rank, global_a_idx in enumerate(I_batch[local_i]):
+            if global_a_idx == -1: continue # Padding case
+            
+            # Get Record A
+            a_record = df_a.iloc[global_a_idx]
+            a_id = str(a_record["id"])
+            
+            # 1. Create Fast Features (Recall Model)
+            # This vector is small (1536 floats)
+            feats = lib.create_pure_embedding_vector(a_record, b_record)
+            
+            X_batch_features.append(feats)
+            batch_pairs_metadata.append((a_record, b_record, a_id, b_id))
+            
+            # Check Ground Truth (if available)
+            is_match = 1.0 if (a_id, b_id) in gt_lookup else 0.0
+            batch_labels.append(is_match)
 
-X_stage1_matrix = np.array(X_stage1_features)
-X_stage1_scaled = scaler.transform(X_stage1_matrix)
-stage1_probs = model.predict(X_stage1_scaled, batch_size=256).flatten()
-stage1_decisions = (stage1_probs > best_threshold1).astype(int)
-y_true_stage1_array = np.array(y_true_list_stage1)
+    # If no candidates found in this batch, skip
+    if not X_batch_features:
+        continue
 
-print("\n--- Stage 1 (Recall Model) Performance on ALL Candidates ---")
-#print(classification_report(y_true_stage1_array, stage1_decisions, target_names=["No Match", "Match"]))
-f1 = f1_score(y_true_stage1_array, stage1_decisions)
-recall = recall_score(y_true_stage1_array,  stage1_decisions)
-precision = precision_score(y_true_stage1_array,  stage1_decisions)
-print(f"F1-score: {f1:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"Precision: {precision:.4f}")
+    # D. Predict Stage 1 (Recall)
+    # This matrix is small! (e.g. 1000 * 5 = 5000 rows)
+    X_batch_np = np.array(X_batch_features)
+    X_batch_scaled = scaler.transform(X_batch_np)
+    
+    # Fast prediction
+    probs_s1 = model.predict(X_batch_scaled, batch_size=256, verbose=0).flatten()
+    
+    # Filter Candidates
+    pass_s1_indices = np.where(probs_s1 > best_threshold1)[0]
+    
+    # E. Predict Stage 2 (Precision) - Only on survivors
+    if len(pass_s1_indices) > 0:
+        X_s2_features = []
+        survivor_metadata = []
+        survivor_labels = []
+        
+        for idx in pass_s1_indices:
+            rec_a, rec_b, aid, bid = batch_pairs_metadata[idx]
+            
+            # Create Hybrid Features (Expensive Jaro-Winkler)
+            # We only do this for the small % of pairs that passed Stage 1
+            hybrid_feats = lib.create_hybrid_feature_vector(rec_a, rec_b, col="title")
+            
+            X_s2_features.append(hybrid_feats)
+            survivor_metadata.append((rec_a, rec_b))
+            survivor_labels.append(batch_labels[idx])
+            
+        # Predict Stage 2
+        X_s2_np = np.array(X_s2_features)
+        X_s2_scaled = precision_scaler.transform(X_s2_np)
+        probs_s2 = precision_model.predict(X_s2_scaled, batch_size=256, verbose=0).flatten()
+        
+        # Final Filter
+        final_indices = np.where(probs_s2 > best_threshold2)[0]
+        
+        # Store Results
+        for final_idx in final_indices:
+            # We store the pair and its true label (to calc final metrics)
+            # If you just need the IDs, store (aid, bid)
+            final_matches.append((survivor_metadata[final_idx], survivor_labels[final_idx]))
+            
+            # Save true label for global metrics (only for predicted positives)
+            y_true_final.append(survivor_labels[final_idx])
 
+# --- 4. Calculate Final Metrics ---
+# Metrics based on "Predicted Positives"
+# Precision = TP / (TP + FP)
+true_positives = sum(y_true_final)
+predicted_positives = len(y_true_final)
 
-# --- 4. Stage 2 (Precision Filter) ---
-stage2_candidate_indices = np.where(stage1_probs > best_threshold1)[0]
-print(f"Stage 1 found {len(stage2_candidate_indices)} high-recall candidates.")
-
-if len(stage2_candidate_indices) > 0:
-    X_stage2_features = []
-    y_true_list_stage2 = [] # For final scoring
-
-    print("Running Stage 2 (Smart Precision)...")
-    for idx in stage2_candidate_indices:
-        a_record, b_record = stage1_pairs_data[idx]
-
-        # Create the SLOW, HYBRID feature vector
-        hybrid_features = lib.create_hybrid_feature_vector(a_record, b_record, col="title")
-        X_stage2_features.append(hybrid_features)
-
-        # Get the true label
-        y_true_list_stage2.append(y_true_list_stage1[idx]) # Get label from our pre-built list
-
-    # --- STAGE 2 PREDICTION ---
-    X_stage2_matrix = np.array(X_stage2_features)
-    X_stage2_scaled = precision_scaler.transform(X_stage2_matrix)
-    stage2_probs = precision_model.predict(X_stage2_scaled, batch_size=256).flatten()
-
-    stage2_decisions = (stage2_probs > best_threshold2).astype(int)
-    y_true_stage2_array = np.array(y_true_list_stage2)
-
-    # --- FINAL RESULTS ---
-    print("\n--- Final Two-Stage Model Performance (on Stage 1 Candidates) ---")
-    #print(classification_report(y_true_stage2_array, stage2_decisions, target_names=["No Match", "Match"]))
-    f1 = f1_score(y_true_stage2_array, stage2_decisions)
-    recall = recall_score(y_true_stage2_array,  stage2_decisions)
-    precision = precision_score(y_true_stage2_array,  stage2_decisions)
-    print(f"F1-score: {f1:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"Precision: {precision:.4f}")
-
-
+if predicted_positives > 0:
+    precision = true_positives / predicted_positives
 else:
-    print("Stage 1 found no candidates.")
+    precision = 0.0
 
+# Recall = TP / Total_Actual_Positives
+# Note: 'matches' must be calculated from your full GT file at the start
+total_actual_matches = len(gt_lookup) # Or the 'matches' variable you calculated earlier
+
+if total_actual_matches > 0:
+    recall = true_positives / total_actual_matches
+else:
+    recall = 0.0
+
+f1 = 2 * (precision * recall) / (precision + recall + 1e-9)
+
+print(f"\n--- Final Scalable Resolution Results ---")
+print(f"Pairs Found: {predicted_positives}")
+print(f"True Matches Found: {int(true_positives)}")
+print(f"Precision: {precision:.4f}")
+print(f"Recall:    {recall:.4f}")
+print(f"F1-Score:  {f1:.4f}")
