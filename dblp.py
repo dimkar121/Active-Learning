@@ -84,7 +84,7 @@ d = embeddings_a.shape[1]
 index = faiss.IndexHNSWFlat(d, 32, faiss.METRIC_INNER_PRODUCT)
 index.hnsw.efConstruction = 60
 index.hnsw.efSearch = 64
-BATCH_SIZE = 1_000
+BATCH_SIZE = 200_000
 for i in tqdm(range(0, len(embeddings_a), BATCH_SIZE)):
     # Slice the batch
     batch = embeddings_a[i : i + BATCH_SIZE]    
