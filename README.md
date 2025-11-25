@@ -33,6 +33,6 @@ The repository is structured to allow for easy replication of the results presen
 ```bash
    python abt.py  
 ```
-uses the Abt-Buy paired dataset.
+uses the ABT-BUY paired dataset.
 
 
