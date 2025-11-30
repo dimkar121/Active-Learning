@@ -34,5 +34,6 @@ The repository is structured to allow for easy replication of the results presen
    python abt.py  
 ```
 uses the ABT-BUY paired dataset.
+The large scale datasets—DBLP and VOTERS—can be found [here](https://drive.google.com/drive/folders/1IM9Ot8zpx11YcwXe_4ZTVeEx6wFaHiOo?usp=sharing).
 
 
