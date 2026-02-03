@@ -25,7 +25,7 @@ RESOLUTION_BATCH_SIZE = 20_000 # Search/Predict in batches of 20k
 
 PATH_RAW_A = './data/test_voters_A_1M.txt'
 PATH_RAW_B = './data/test_voters_B_1M.txt'
-PATH_GT = './data/truth_VOTERS.csv'
+PATH_GT = './data/truth_VOTERS_1M.csv'
 ID_COL_A = 'id1'
 ID_COL_B = 'id2'
 COLS_TO_USE = [ "surname", "name", "address" ,"town" ,"ps" ]
@@ -36,8 +36,8 @@ start_total_time = time.time()
 print("--- Loading Raw Data and Oracle ---")
 cols=["id", "surname", "name", "address" ,"town" ,"ps" ]
 # nrows=500_000 for testing. Remove 'nrows' for full run.
-df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="unicode_escape",names=cols, on_bad_lines='skip', nrows=500_000)
-df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="unicode_escape",names=cols, on_bad_lines='skip', nrows=500_000)
+df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="unicode_escape",names=cols, on_bad_lines='skip')
+df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="unicode_escape",names=cols, on_bad_lines='skip')
 df_gt = pd.read_csv(PATH_GT, encoding="utf-8", keep_default_na=False, nrows=200_000)
 
 truthD = dict()

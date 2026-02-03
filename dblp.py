@@ -34,9 +34,9 @@ start_total_time = time.time()
 
 print("--- Loading Raw Data and Oracle ---")
 cols=["id","author1","author2","title","year"]
-df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip', nrows=1_000_000 )
-df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip', nrows=1_000_000   )
-df_gt = pd.read_csv(PATH_GT, encoding="utf-8",  keep_default_na=False,  nrows=500_000 )
+df_a_raw = pd.read_csv(PATH_RAW_A, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip' )
+df_b_raw = pd.read_csv(PATH_RAW_B, sep=",",encoding="utf-8",names=cols, on_bad_lines='skip' )
+df_gt = pd.read_csv(PATH_GT, encoding="utf-8",  keep_default_na=False )
 
 truthD = dict()
 for i, r in df_gt.iterrows():
