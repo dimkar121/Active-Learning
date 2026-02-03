@@ -10,9 +10,8 @@ from sklearn.cluster import MiniBatchKMeans
 # --- 1. Configuration & Setup ---
 
 # --- Scalability Settings ---
-N_PARTITIONS = 4 # Split the dataset into 20 chunks
-NUM_ITERATIONS_PER_PARTITION = 8 # Run 3 AL iterations on each chunk
-LABELS_PER_ITERATION = 200 # Query 200 labels per iteration
+NUM_ITERATIONS_PER_PARTITION = 4 # Run 3 AL iterations on each chunk
+LABELS_PER_ITERATION = 300 # Query 200 labels per iteration
 SEED_SIZE = 100             # Seed each partition's loop with 20 labels
 
 # --- NEW: Validation Set Configuration ---
@@ -70,8 +69,11 @@ df_a, df_b = lib.bootstrap_embeddings_only(
 
 google_embeddings = np.array(df_b['v'].tolist()).astype('float32')
 df_b_whole  = df_b
-SAMPLE_PROPORTION = 0.4
+SAMPLE_PROPORTION = 0.2
 SAMPLE_SIZE= int(len(df_b) * SAMPLE_PROPORTION)
+N_PARTITIONS = 3 #  int(np.log10(SAMPLE_SIZE))
+print(f"N={N_PARTITIONS} chunks")
+
 df_b = df_b.sample(n=SAMPLE_SIZE, random_state=42)
 
 # Create fast lookup dicts (text -> full record)
@@ -288,92 +290,104 @@ else:
 
 
 # --- 8. Phase 4: Final Two-Stage Resolution ---
-# (This section is the same as your scholar.py script)
-# ...
 
 
 print("\n--- Starting Final Two-Stage Resolution ---")
 
 
-# 2. Search with all of df_b (DBLP)
+# --- 8. Phase 4: Held-Out Test Set (Classifier Metrics) ---
+
+print("\n--- Starting Final Resolution (Held-Out Test Set, Classifier Metrics) ---")
+
+# 1. Identify Training/Validation IDs to Exclude
+train_val_ids = set(df_b['id'].astype(str).tolist()) 
+
+# 2. Search
 faiss.normalize_L2(google_embeddings)
 D, I = index.search(google_embeddings, k=5)
 
-# --- 3. Stage 1 (Recall Filter) ---
+# --- Stage 1 (Recall Filter) ---
 X_stage1_features = []
-stage1_pairs_data = [] # Store (scholar_record, dblp_record)
-y_true_list_stage1 = [] # Store all true labels for a *full* recall calculation
+stage1_pairs_data = [] 
+y_true_list_stage1 = [] 
 
-print("Running Stage 1 (Fast Recall)...")
+print("Running Stage 1 on HELD-OUT TEST SET only...")
 for google_idx, amazon_indices in enumerate(I):
     google_record = df_b_whole.iloc[google_idx]
+    
+    if str(google_record['id']) in train_val_ids:
+        continue 
+    # ----------------------
 
     for amazon_idx in amazon_indices:
         amazon_record = df_a.iloc[amazon_idx]
-
-        # Add to lists
+        
         stage1_pairs_data.append((amazon_record, google_record))
         X_stage1_features.append(lib.create_pure_embedding_vector(amazon_record, google_record))
 
-        # Get true label for this pair
+        # Check Ground Truth
         amazon_id = str(amazon_record["id"])
         google_id = str(google_record["id"])
-        y_true_list_stage1.append(1.0 if (amazon_id, google_id) in gt_lookup else 0.0)
+        is_match = 1.0 if (amazon_id, google_id) in gt_lookup else 0.0
+        y_true_list_stage1.append(is_match)
 
+# Predict Stage 1
 X_stage1_matrix = np.array(X_stage1_features)
 X_stage1_scaled = scaler.transform(X_stage1_matrix)
 stage1_probs = model.predict(X_stage1_scaled, batch_size=256).flatten()
 stage1_decisions = (stage1_probs > best_threshold1).astype(int)
 y_true_stage1_array = np.array(y_true_list_stage1)
 
-print("\n--- Stage 1 (Recall Model) Performance on ALL Candidates ---")
-#print(classification_report(y_true_stage1_array, stage1_decisions, target_names=["No Match", "Match"]))
-f1 = f1_score(y_true_stage1_array, stage1_decisions)
-recall = recall_score(y_true_stage1_array,  stage1_decisions)
-precision = precision_score(y_true_stage1_array,  stage1_decisions)
-print(f"F1-score: {f1:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"Precision: {precision:.4f}")
 
 
-# --- 4. Stage 2 (Precision Filter) ---
+# --- Stage 2 (Precision Filter) ---
 stage2_candidate_indices = np.where(stage1_probs > best_threshold1)[0]
-print(f"Stage 1 found {len(stage2_candidate_indices)} high-recall candidates.")
+print(f"\nStage 1 passed {len(stage2_candidate_indices)} candidates to Stage 2.")
 
 if len(stage2_candidate_indices) > 0:
     X_stage2_features = []
-    y_true_list_stage2 = [] # For final scoring
+    
+    # Get truth labels ONLY for the candidates in the pool
+    # This maintains the "Old Logic"
+    y_true_list_stage2 = y_true_stage1_array[stage2_candidate_indices]
 
-    print("Running Stage 2 (Smart Precision)...")
     for idx in stage2_candidate_indices:
         amazon_record, google_record = stage1_pairs_data[idx]
-
-        # Create the SLOW, HYBRID feature vector
         hybrid_features = lib.create_hybrid_feature_vector(amazon_record, google_record, col="name")
         X_stage2_features.append(hybrid_features)
 
-        # Get the true label
-        y_true_list_stage2.append(y_true_list_stage1[idx]) # Get label from our pre-built list
-
-    # --- STAGE 2 PREDICTION ---
     X_stage2_matrix = np.array(X_stage2_features)
     X_stage2_scaled = precision_scaler.transform(X_stage2_matrix)
     stage2_probs = precision_model.predict(X_stage2_scaled, batch_size=256).flatten()
-
     stage2_decisions = (stage2_probs > best_threshold2).astype(int)
-    y_true_stage2_array = np.array(y_true_list_stage2)
 
-    # --- FINAL RESULTS ---
-    print("\n--- Final Two-Stage Model Performance (on Stage 1 Candidates) ---")
-    #print(classification_report(y_true_stage2_array, stage2_decisions, target_names=["No Match", "Match"]))
-    f1 = f1_score(y_true_stage2_array, stage2_decisions)
-    recall = recall_score(y_true_stage2_array,  stage2_decisions)
-    precision = precision_score(y_true_stage2_array,  stage2_decisions)
-    print(f"F1-score: {f1:.4f}")
-    print(f"Recall: {recall:.4f}")
-    print(f"Precision: {precision:.4f}")
-
+    print("\n--- Final Two-Stage Classifier Performance ---")
+    
+    # Specific Print for easier reading
+    f1 = f1_score(y_true_list_stage2, stage2_decisions)
+    rec = recall_score(y_true_list_stage2, stage2_decisions)
+    prec = precision_score(y_true_list_stage2, stage2_decisions)
+    
+    print(f"Classifier F1: {f1:.4f}")
+    print(f"Classifier Recall: {rec:.4f}")
+    print(f"Classifier Precision: {prec:.4f}")
 
 else:
     print("Stage 1 found no candidates.")
+
+
+
+
+
+real_total_labels = len(master_clean_training_set) + len(fast_validation_set)
+active_queries = len(master_clean_training_set) - (SEED_SIZE * N_PARTITIONS) 
+
+print("\n" + "="*30)
+print("="*30)
+print(f"Paritions: {N_PARTITIONS}")
+print(f"Seed (B_seed): {SEED_SIZE * N_PARTITIONS}") # Total seeds across all chunks
+print(f"Valid (|V|):   {len(fast_validation_set)}")
+print(f"Active Loop:   {active_queries}") 
+print(f"Total Budget:  {real_total_labels}")
+print("="*30)
 

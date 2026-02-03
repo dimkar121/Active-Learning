@@ -10,15 +10,15 @@ import time
 # --- 1. Configuration & Setup ---
 
 # --- Scalability Settings ---
-NUM_ITERATIONS_PER_PARTITION = 5 # Run 3 AL iterations on each chunk
-LABELS_PER_ITERATION = 200 # Query 200 labels per iteration
-SEED_SIZE = 200             # Seed each partition's loop with 20 labels
+NUM_ITERATIONS_PER_PARTITION = 4 # Run 3 AL iterations on each chunk
+LABELS_PER_ITERATION = 300 # Query 200 labels per iteration
+SEED_SIZE = 100             # Seed each partition's loop with 20 labels
 
 # --- NEW: Validation Set Configuration ---
 # We create one fixed, fast validation set.
 # We'll make it proportional to the *first* partition's candidate pool,
 # but cap it to ensure it's always fast.
-VAL_SET_PROPORTION = 0.2
+VAL_SET_PROPORTION = 0.1
 VAL_SET_MAX_SIZE = 20000  # Cap at 20,000 pairs
 
 # --- Data paths and columns ---
@@ -62,7 +62,7 @@ print(f"Loaded Oracle with {len(gt_lookup)} total matches.")
 
 SAMPLE_PROPORTION = 0.3
 SAMPLE_SIZE= int(len(df_b_raw) * SAMPLE_PROPORTION)
-N_PARTITIONS = int(np.log10(SAMPLE_SIZE))
+N_PARTITIONS = 3 #  int(np.log10(SAMPLE_SIZE))
 print(f"N={N_PARTITIONS} chunks")
 
 # --- 3. Bootstrap Embeddings (Phase 1) ---
@@ -298,97 +298,111 @@ time1 = time_end_training - time_start_training
 print(f"Training Time {time1} seconds.")
 
 
-
-
 time_start_res = time.time()
-
 print("\n--- Starting Final Two-Stage Resolution ---")
 
 
-# 2. Search with all of df_b (DBLP)
+
+# --- 8. Phase 4: Final Resolution (Held-Out Test Set, Classifier Metrics) ---
+
+print("\n--- Starting Final Resolution (Abt-Buy Test Set, Classifier Metrics) ---")
+
+# 1. Identify Training/Validation IDs to Exclude
+train_val_ids = set(df_b['id'].astype(str).tolist()) 
+
+# 2. Search
 faiss.normalize_L2(buy_embeddings)
 D, I = index.search(buy_embeddings, k=5)
 
-# --- 3. Stage 1 (Recall Filter) ---
+# --- Stage 1 (Recall Filter) ---
 X_stage1_features = []
-stage1_pairs_data = [] # Store (scholar_record, dblp_record)
-y_true_list_stage1 = [] # Store all true labels for a *full* recall calculation
+stage1_pairs_data = [] 
+y_true_list_stage1 = [] 
 
-print("Running Stage 1 (Fast Recall)...")
+print("Running Stage 1 on HELD-OUT TEST SET only...")
 for buy_idx, abt_indices in enumerate(I):
     buy_record = df_b_whole.iloc[buy_idx]
+    
+    # --- LEAKAGE FILTER ---
+    # We strictly ignore any record used in training
+    if str(buy_record['id']) in train_val_ids:
+        continue 
+    # ----------------------
 
     for abt_idx in abt_indices:
         abt_record = df_a.iloc[abt_idx]
-
-        # Add to lists
+        
         stage1_pairs_data.append((abt_record, buy_record))
         X_stage1_features.append(lib.create_pure_embedding_vector(abt_record, buy_record))
 
-        # Get true label for this pair
+        # Check Ground Truth
         abt_id = str(abt_record["id"])
         buy_id = str(buy_record["id"])
-        y_true_list_stage1.append(1.0 if (abt_id, buy_id) in gt_lookup else 0.0)
+        is_match = 1.0 if (abt_id, buy_id) in gt_lookup else 0.0
+        y_true_list_stage1.append(is_match)
 
+# Predict Stage 1
 X_stage1_matrix = np.array(X_stage1_features)
 X_stage1_scaled = scaler.transform(X_stage1_matrix)
 stage1_probs = model.predict(X_stage1_scaled, batch_size=256).flatten()
 stage1_decisions = (stage1_probs > best_threshold1).astype(int)
 y_true_stage1_array = np.array(y_true_list_stage1)
 
-print("\n--- Stage 1 (Recall Model) Performance on ALL Candidates ---")
-#print(classification_report(y_true_stage1_array, stage1_decisions, target_names=["No Match", "Match"]))
-f1 = f1_score(y_true_stage1_array, stage1_decisions)
-recall = recall_score(y_true_stage1_array,  stage1_decisions)
-precision = precision_score(y_true_stage1_array,  stage1_decisions)
-print(f"F1-score: {f1:.4f}")
-print(f"Recall: {recall:.4f}")
-print(f"Precision: {precision:.4f}")
+print("\n--- Stage 1 (Recall Model) Classifier Performance ---")
+# Metrics here define "Recall" as: TP / (TP + FN in candidate pool)
 
 
-# --- 4. Stage 2 (Precision Filter) ---
+# --- Stage 2 (Precision Filter) ---
 stage2_candidate_indices = np.where(stage1_probs > best_threshold1)[0]
-print(f"Stage 1 found {len(stage2_candidate_indices)} high-recall candidates.")
+print(f"\nStage 1 passed {len(stage2_candidate_indices)} candidates to Stage 2.")
 
 if len(stage2_candidate_indices) > 0:
     X_stage2_features = []
-    y_true_list_stage2 = [] # For final scoring
+    
+    # Get truth labels ONLY for the candidates in the pool
+    y_true_list_stage2 = y_true_stage1_array[stage2_candidate_indices]
 
-    print("Running Stage 2 (Smart Precision)...")
     for idx in stage2_candidate_indices:
         abt_record, buy_record = stage1_pairs_data[idx]
-
-        # Create the SLOW, HYBRID feature vector
+        # Ensure col="name" is correct for Abt-Buy features
         hybrid_features = lib.create_hybrid_feature_vector(abt_record, buy_record, col="name")
         X_stage2_features.append(hybrid_features)
 
-        # Get the true label
-        y_true_list_stage2.append(y_true_list_stage1[idx]) # Get label from our pre-built list
-
-    # --- STAGE 2 PREDICTION ---
     X_stage2_matrix = np.array(X_stage2_features)
     X_stage2_scaled = precision_scaler.transform(X_stage2_matrix)
     stage2_probs = precision_model.predict(X_stage2_scaled, batch_size=256).flatten()
-
     stage2_decisions = (stage2_probs > best_threshold2).astype(int)
-    y_true_stage2_array = np.array(y_true_list_stage2)
 
-    # --- FINAL RESULTS ---
-    print("\n--- Final Two-Stage Model Performance (on Stage 1 Candidates) ---")
-    #print(classification_report(y_true_stage2_array, stage2_decisions, target_names=["No Match", "Match"]))
-    f1 = f1_score(y_true_stage2_array, stage2_decisions)
-    recall = recall_score(y_true_stage2_array,  stage2_decisions)
-    precision = precision_score(y_true_stage2_array,  stage2_decisions)
-    print(f"F1-score: {f1:.4f} @{best_threshold2}")
-    print(f"Recall: {recall:.4f}")
-    print(f"Precision: {precision:.4f}")
-
+    print("\n--- Final Two-Stage Classifier Performance ---")
+    
+    # Specific Print for easier reading
+    f1 = f1_score(y_true_list_stage2, stage2_decisions)
+    rec = recall_score(y_true_list_stage2, stage2_decisions)
+    prec = precision_score(y_true_list_stage2, stage2_decisions)
+    
+    print(f"Classifier F1: {f1:.4f}")
+    print(f"Classifier Recall: {rec:.4f}")
+    print(f"Classifier Precision: {prec:.4f}")
 
 else:
     print("Stage 1 found no candidates.")
 
 
+
+
+
+
+
+
+
 time_end_res = time.time()
 time1 = time_end_res - time_start_res
 print(f"Resolution Time {time1} seconds.")
+
+print(f"Paritions: {N_PARTITIONS}")
+print(f"Seed (B_seed): {SEED_SIZE}")
+print(f"Valid (|V|):   {len(fast_validation_set)}") 
+print(f"Active Loop:   {total_labels - SEED_SIZE - len(fast_validation_set)}")
+print(f"Total Budget:  {total_labels}")
+
 
