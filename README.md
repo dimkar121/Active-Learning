@@ -15,7 +15,7 @@ The experiments were conducted on a diverse suite of nine real-world and semi-sy
 * **Resaturants matching:** Restaurants
 * **Large-Scale Synthetic:** DBLP, VOTERS
 
-All experiments were run using the `MiniLM-L6-v2` model for embeddings generation.
+All experiments were run using the `MiniLM-L6-v2` and `BGE-base-en-v1.5` embedding models.
 
 ## ⚙️ Setup and Installation
 
